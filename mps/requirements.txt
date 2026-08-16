@@ -5,3 +5,7 @@ signxml==4.4.0
 httpx==0.28.1
 cryptography==44.0.2
 pydantic-settings==2.8.1
+sqlalchemy==2.0.41
+alembic==1.16.4
+psycopg[binary]==3.2.9
+pyjwt==2.10.1
