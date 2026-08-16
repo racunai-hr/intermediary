@@ -10,7 +10,7 @@ from app.certificate import load_p12
 from app.config import DOCUMENT_ID, Settings
 from app.metadata import build_signed_service_metadata
 
-CERT_PATH = Path('/opt/stacks/racunai.hr/erp/.certificates/36619131370.F2.2.p12')
+CERT_PATH = Path('/opt/stacks/racunai.hr/.certificates/36619131370.F2.2.p12')
 CERT_PASSWORD = os.environ.get('MPS_CERT_P12_PASSWORD', 'Orangepi.123')
 PARTICIPANT = 'iso6523-actorid-upis::9934:36619131370'
 
