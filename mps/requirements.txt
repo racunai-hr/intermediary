@@ -1,0 +1,7 @@
+fastapi==0.115.12
+uvicorn[standard]==0.34.3
+lxml==5.3.2
+signxml==4.4.0
+httpx==0.28.1
+cryptography==44.0.2
+pydantic-settings==2.8.1
