@@ -7,6 +7,7 @@ from app.gateway.adapters.super.adapter import SuperAdapter
 from app.gateway.canonical import require_oib
 from app.gateway.errors import GatewayError, document_not_found, invalid_request
 from app.gateway.models import Binding, Document, Reconciliation
+from app.gateway.services.outbound_provider import get_config
 from app.gateway.services.inbound_pull import (
     apply_outbound_status_row,
     checkpoint_filters,
@@ -46,26 +47,30 @@ def run_reconciliation(session_factory, reconciliation_id) -> None:
             .filter_by(taxpayer_oib=job.taxpayer_oib, status='ACTIVE')
             .one_or_none()
         )
-        adapter = get_adapter(binding.provider) if binding else None
-        if binding is None or not isinstance(adapter, SuperAdapter):
-            job.status = 'FAILED'
-            job.error_code = 'CAPABILITY_NOT_SUPPORTED' if binding else 'BINDING_NOT_ACTIVE'
-            job.error_message = 'Reconciliation requires an active Super binding.'
-            job.retryable = False
-            session.commit()
-            return
-        try:
-            credential = adapter.resolve(binding.credential_ref)
-        except GatewayError as exc:
-            job.status = 'FAILED'
-            job.error_code = exc.code
-            job.error_message = exc.message
-            job.retryable = False
-            session.commit()
-            return
-        checkpoint, filters = checkpoint_filters(
-            session, job.taxpayer_oib, credential.company_guid, 'inbound_list'
-        )
+        inbound_adapter = get_adapter(binding.provider) if binding else None
+        inbound_credential = None
+        inbound_filters = None
+        inbound_setup_error = None
+        if binding is not None:
+            if not isinstance(inbound_adapter, SuperAdapter):
+                job.status = 'FAILED'
+                job.error_code = 'CAPABILITY_NOT_SUPPORTED'
+                job.error_message = 'Reconciliation requires a Super inbound binding.'
+                job.retryable = False
+                session.commit()
+                return
+            try:
+                inbound_credential = inbound_adapter.resolve(binding.credential_ref)
+                _, inbound_filters = checkpoint_filters(
+                    session, job.taxpayer_oib, inbound_credential.company_guid, 'inbound_list'
+                )
+            except GatewayError as exc:
+                job.status = 'FAILED'
+                job.error_code = exc.code
+                job.error_message = exc.message
+                job.retryable = False
+                session.commit()
+                return
         outbound_docs = (
             session.query(Document)
             .filter_by(
@@ -76,7 +81,12 @@ def run_reconciliation(session_factory, reconciliation_id) -> None:
             .filter(Document.provider_invoice_guid.isnot(None))
             .all()
         )
-        guids = [doc.provider_invoice_guid for doc in outbound_docs if doc.provider_invoice_guid]
+        outbound_groups: list[tuple] = []
+        for document in outbound_docs:
+            config = get_config(session, document.outbound_provider_config_id)
+            if config is None or not config.credential_ref:
+                continue
+            outbound_groups.append((document, config))
         session.commit()
     except Exception:
         session.rollback()
@@ -84,17 +94,34 @@ def run_reconciliation(session_factory, reconciliation_id) -> None:
         raise
     session.close()
 
-    inbound_error = None
+    inbound_error = inbound_setup_error
     outbound_error = None
     batch: list = []
-    statuses: list = []
+    status_rows: list[tuple[str, dict]] = []
+    if inbound_credential is not None and inbound_filters is not None and inbound_adapter is not None:
+        try:
+            batch = fetch_inbound_batch(inbound_adapter, inbound_credential, inbound_filters)
+        except GatewayError as exc:
+            inbound_error = exc
+    grouped: dict[str, list] = {}
+    configs_by_id: dict = {}
+    for document, config in outbound_groups:
+        grouped.setdefault(str(config.id), []).append(document)
+        configs_by_id[str(config.id)] = config
     try:
-        batch = fetch_inbound_batch(adapter, credential, filters)
-    except GatewayError as exc:
-        inbound_error = exc
-    try:
-        if guids:
-            statuses = adapter.list_outbound_statuses(credential, guids)
+        for config_id, docs in grouped.items():
+            config = configs_by_id[config_id]
+            adapter = get_adapter(config.provider)
+            if not isinstance(adapter, SuperAdapter):
+                continue
+            credential = adapter.resolve(config.credential_ref)
+            if docs[0].provider_account_key and credential.company_guid != docs[0].provider_account_key:
+                continue
+            guids = [doc.provider_invoice_guid for doc in docs if doc.provider_invoice_guid]
+            if not guids:
+                continue
+            for item in adapter.list_outbound_statuses(credential, guids):
+                status_rows.append((docs[0].provider_account_key or credential.company_guid, item))
     except GatewayError as exc:
         outbound_error = exc
 
@@ -106,23 +133,25 @@ def run_reconciliation(session_factory, reconciliation_id) -> None:
             .filter_by(taxpayer_oib=job.taxpayer_oib, status='ACTIVE')
             .one_or_none()
         )
-        checkpoint, _ = checkpoint_filters(session, job.taxpayer_oib, credential.company_guid, 'inbound_list')
         inbound_stats = {'created': 0, 'errors': 0}
-        if inbound_error is None and binding is not None:
+        if inbound_error is None and binding is not None and inbound_credential is not None:
+            checkpoint, _ = checkpoint_filters(
+                session, job.taxpayer_oib, inbound_credential.company_guid, 'inbound_list'
+            )
             inbound_stats = persist_inbound_batch(
                 session,
                 binding=binding,
-                credential=credential,
+                credential=inbound_credential,
                 batch=batch,
                 checkpoint=checkpoint,
             )
         updated = 0
         if outbound_error is None:
-            for item in statuses:
+            for account_key, item in status_rows:
                 if apply_outbound_status_row(
                     session,
                     taxpayer_oib=job.taxpayer_oib,
-                    account_key=credential.company_guid,
+                    account_key=account_key,
                     item=item,
                 ):
                     updated += 1

@@ -18,6 +18,13 @@ from app.gateway.services.bindings import (
     put_binding,
     serialize_binding,
 )
+from app.gateway.services.outbound_provider import (
+    get_actual,
+    inbound_readiness,
+    outbound_readiness,
+    put_outbound_provider,
+    serialize_config,
+)
 from app.gateway.services.dispatch import process_attempt
 from app.gateway.services.documents import serialize_document
 from app.gateway.services.idempotency import run_idempotent, update_stored_response
@@ -82,17 +89,24 @@ def provider_capabilities(
         raise capability_not_supported('racunai_direct is disabled for this API version.')
     adapter = get_adapter(provider)
     caps = adapter.capabilities()
-    readiness = {
+    outbound = {
         'configured': False,
-        'active_binding': False,
         'credential_available': False,
+        'provider_account_resolved': False,
+        'ready': False,
     }
-    if taxpayer_oib and isinstance(adapter, SuperAdapter):
+    inbound = {'active_binding': False}
+    if taxpayer_oib:
         require_oib(taxpayer_oib)
         require_taxpayer(principal, taxpayer_oib)
-        binding = next((item for item in list_bindings(session, taxpayer_oib) if item.status == 'ACTIVE'), None)
-        readiness = adapter.readiness(binding)
-    return {'provider': provider, **caps, 'readiness': readiness}
+        outbound = outbound_readiness(get_actual(session, taxpayer_oib))
+        inbound = inbound_readiness(session, taxpayer_oib)
+    return {
+        'provider': provider,
+        **caps,
+        'outbound_readiness': outbound,
+        'inbound_readiness': inbound,
+    }
 
 
 @router.get('/taxpayers/{oib}/inbound-binding')
@@ -159,6 +173,49 @@ def confirm_inbound_binding(
         key=key,
         request_hash=request_hash(
             method='POST', path=request.url.path, taxpayer_oib=oib, body=payload
+        ),
+        action=action,
+    )
+    return _json(response, status, body)
+
+
+@router.get('/taxpayers/{oib}/outbound-provider')
+def get_outbound_provider(
+    oib: str,
+    principal: Principal = Depends(require_scope('gateway.read')),
+    session: Session = Depends(get_session),
+):
+    require_oib(oib)
+    require_taxpayer(principal, oib)
+    return serialize_config(get_actual(session, oib))
+
+
+@router.put('/taxpayers/{oib}/outbound-provider')
+def upsert_outbound_provider(
+    oib: str,
+    payload: dict[str, Any],
+    request: Request,
+    response: Response,
+    principal: Principal = Depends(require_scope('gateway.admin')),
+    session: Session = Depends(get_session),
+    key: str = Depends(_idempotency_key),
+):
+    require_oib(oib)
+    require_taxpayer(principal, oib)
+
+    def action():
+        config = put_outbound_provider(session, oib, payload, created_by=principal.subject)
+        return 200, serialize_config(config)
+
+    status, body = run_idempotent(
+        session,
+        principal=principal.subject,
+        key=key,
+        request_hash=request_hash(
+            method='PUT',
+            path=request.url.path,
+            taxpayer_oib=oib,
+            body=payload,
         ),
         action=action,
     )

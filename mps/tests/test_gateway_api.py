@@ -8,7 +8,7 @@ from sqlalchemy import text
 
 from app.gateway.models import Binding, Document, OutboxEvent
 from app.gateway.services.outbox import record_event
-from tests.conftest import OTHER_OIB, TEST_OIB, auth_header, requires_postgres
+from tests.conftest import OTHER_OIB, OUTBOUND_TEST_OIB, TEST_OIB, auth_header, requires_postgres
 
 UBL = '<Invoice xmlns="urn:oasis:names:specification:ubl:schema:xsd:Invoice-2"><ID>1</ID></Invoice>'
 
@@ -40,6 +40,28 @@ def _activate(client, oib=TEST_OIB, provider='super'):
         headers=_headers(str(uuid.uuid4())),
     )
     assert response.status_code == 200, response.text
+    return response.json()
+
+
+def _configure_outbound(
+    client,
+    oib=OUTBOUND_TEST_OIB,
+    credential_ref='test-cred',
+    status='CONFIGURED',
+    change_reason='test',
+):
+    payload = {'status': status, 'change_reason': change_reason}
+    if credential_ref is not None:
+        payload['credential_ref'] = credential_ref
+    if status == 'CONFIGURED':
+        payload['provider'] = 'super'
+    response = client.put(
+        f'/v1/taxpayers/{oib}/outbound-provider',
+        json=payload,
+        headers=_headers(str(uuid.uuid4())),
+    )
+    assert response.status_code == 200, response.text
+    assert 'credential_ref' not in response.text
     return response.json()
 
 
@@ -77,42 +99,38 @@ def test_secrets_rejected_on_binding(client):
 
 
 @requires_postgres
-def test_outbound_blocked_and_idempotent_replay(client):
-    _activate(client)
+def test_outbound_unconfigured_does_not_reserve_idempotency_key(client):
     document_id = str(uuid.uuid4())
     key = str(uuid.uuid4())
+    unused_oib = f'{uuid.uuid4().int % 10**11:011d}'
     payload = {
         'document_id': document_id,
-        'taxpayer_oib': TEST_OIB,
+        'taxpayer_oib': unused_oib,
         'direction': 'OUTBOUND',
         'document_type': 'INVOICE',
         'ubl': UBL,
     }
     first = client.post('/v1/outbound/documents', json=payload, headers=_headers(key))
-    assert first.status_code == 202
-    body = first.json()
-    assert body['exchange_status'] == 'QUEUED'
-    assert body['processing'] == {'state': 'BLOCKED', 'reason': 'PROVIDER_NOT_CONFIGURED'}
+    assert first.status_code == 409
+    assert first.json()['error']['code'] == 'PROVIDER_NOT_CONFIGURED'
     second = client.post('/v1/outbound/documents', json=payload, headers=_headers(key))
-    assert second.status_code == 202
-    assert second.json()['attempt_id'] == body['attempt_id']
-    conflict = client.post(
-        '/v1/outbound/documents',
-        json={**payload, 'document_type': 'CREDIT_NOTE'},
-        headers=_headers(key),
-    )
-    assert conflict.status_code == 409
-    assert conflict.json()['error']['code'] == 'IDEMPOTENCY_CONFLICT'
+    assert second.status_code == 409
+    assert second.json()['error']['code'] == 'PROVIDER_NOT_CONFIGURED'
 
 
 @requires_postgres
-def test_concurrent_idempotency(client):
-    _activate(client)
+def test_concurrent_idempotency(client, monkeypatch):
+    from app.gateway.settings import get_gateway_settings
+    from tests.super_http import credentials_json
+
+    monkeypatch.setenv('GATEWAY_SUPER_CREDENTIALS_JSON', credentials_json())
+    get_gateway_settings.cache_clear()
+    _configure_outbound(client)
     document_id = str(uuid.uuid4())
     key = str(uuid.uuid4())
     payload = {
         'document_id': document_id,
-        'taxpayer_oib': TEST_OIB,
+        'taxpayer_oib': OUTBOUND_TEST_OIB,
         'direction': 'OUTBOUND',
         'document_type': 'INVOICE',
         'ubl': UBL,
@@ -136,24 +154,10 @@ def test_concurrent_idempotency(client):
 
 
 @requires_postgres
-def test_binding_supersede_and_document_keeps_old_binding(client, db_session):
+def test_binding_supersede_keeps_previous_inbound_row(client, db_session):
     first = _activate(client)
-    document_id = str(uuid.uuid4())
-    client.post(
-        '/v1/outbound/documents',
-        json={
-            'document_id': document_id,
-            'taxpayer_oib': TEST_OIB,
-            'direction': 'OUTBOUND',
-            'document_type': 'INVOICE',
-            'ubl': UBL,
-        },
-        headers=_headers(str(uuid.uuid4())),
-    )
     second = _activate(client)
     assert second['binding_id'] != first['binding_id']
-    document = db_session.get(Document, uuid.UUID(document_id))
-    assert str(document.binding_id) == first['binding_id']
     old = db_session.get(Binding, uuid.UUID(first['binding_id']))
     assert old.status == 'SUPERSEDED'
 
@@ -284,20 +288,27 @@ def test_cursor_same_timestamp_and_foreign_oib(client, db_session):
 
 
 @requires_postgres
-def test_payment_validation_and_existing_outbound_only(client):
-    _activate(client)
+def test_payment_validation_and_existing_outbound_only(client, monkeypatch):
+    from app.gateway.settings import get_gateway_settings
+    from tests.super_http import credentials_json
+
+    monkeypatch.setenv('GATEWAY_SUPER_CREDENTIALS_JSON', credentials_json())
+    get_gateway_settings.cache_clear()
+    monkeypatch.setattr('app.gateway.routes.v1.process_attempt', lambda *args, **kwargs: None)
+    _configure_outbound(client)
     document_id = str(uuid.uuid4())
-    client.post(
+    created = client.post(
         '/v1/outbound/documents',
         json={
             'document_id': document_id,
-            'taxpayer_oib': TEST_OIB,
+            'taxpayer_oib': OUTBOUND_TEST_OIB,
             'direction': 'OUTBOUND',
             'document_type': 'INVOICE',
             'ubl': UBL,
         },
         headers=_headers(str(uuid.uuid4())),
     )
+    assert created.status_code == 202, created.text
     missing = client.post(
         f'/v1/outbound/documents/{uuid.uuid4()}/payments',
         json={

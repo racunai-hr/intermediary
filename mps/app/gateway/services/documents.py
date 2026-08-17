@@ -12,7 +12,7 @@ from app.gateway.errors import (
     invalid_ubl,
 )
 from app.gateway.models import Attempt, Document, Payment
-from app.gateway.services.bindings import require_active_binding
+from app.gateway.services.outbound_provider import require_ready_outbound
 from app.gateway.services.attempts import (
     KIND_E_REPORTING_REJECT,
     KIND_OUTBOUND_SEND,
@@ -40,6 +40,10 @@ def serialize_document(document: Document) -> dict:
         'document_type': document.document_type,
         'bound_provider': document.bound_provider,
         'binding_id': str(document.binding_id) if document.binding_id else None,
+        'outbound_provider_config_id': (
+            str(document.outbound_provider_config_id) if document.outbound_provider_config_id else None
+        ),
+        'outbound_provider_generation': document.outbound_provider_generation,
         'attempt_id': str(document.attempt_id),
         'provider_refs': document.provider_refs or {},
         'processing': {
@@ -90,14 +94,17 @@ def create_outbound(session: Session, taxpayer_oib: str, payload: dict) -> dict:
         ):
             raise invalid_request('Existing document identity cannot be changed.')
         return serialize_document(existing)
-    binding = require_active_binding(session, taxpayer_oib)
+    config = require_ready_outbound(session, taxpayer_oib)
     document = Document(
         document_id=document_id,
         taxpayer_oib=taxpayer_oib,
         direction='OUTBOUND',
         document_type=document_type,
-        binding_id=binding.id,
-        bound_provider=binding.provider,
+        binding_id=None,
+        outbound_provider_config_id=config.id,
+        outbound_provider_generation=config.generation,
+        bound_provider=config.provider,
+        provider_account_key=config.provider_account_key,
         ubl=ubl,
         ubl_sha256=sha256_text(ubl),
         attempt_id=uuid.uuid4(),
@@ -107,7 +114,7 @@ def create_outbound(session: Session, taxpayer_oib: str, payload: dict) -> dict:
         payment_status='UNPAID',
         processing_state=None,
         processing_reason=None,
-        provider_refs={},
+        provider_refs={'company_guid': config.provider_account_key} if config.provider_account_key else {},
     )
     session.add(document)
     session.flush()

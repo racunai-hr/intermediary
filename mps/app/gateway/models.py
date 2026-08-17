@@ -53,6 +53,34 @@ class Binding(Base):
     )
 
 
+class OutboundProviderConfig(Base):
+    __tablename__ = 'outbound_provider_configs'
+    __table_args__ = (
+        UniqueConstraint('taxpayer_oib', 'generation', name='uq_gateway_outbound_provider_oib_generation'),
+        Index(
+            'uq_gateway_outbound_provider_actual_oib',
+            'taxpayer_oib',
+            unique=True,
+            postgresql_where=text("status IN ('CONFIGURED', 'DISABLED')"),
+        ),
+        {'schema': SCHEMA},
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    taxpayer_oib: Mapped[str] = mapped_column(String(11), nullable=False, index=True)
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    generation: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    credential_ref: Mapped[str | None] = mapped_column(String(255))
+    provider_account_key: Mapped[str | None] = mapped_column(String(64))
+    created_by: Mapped[str | None] = mapped_column(String(255))
+    change_reason: Mapped[str | None] = mapped_column(String(255))
+    superseded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
 class Document(Base):
     __tablename__ = 'documents'
     __table_args__ = (
@@ -104,7 +132,13 @@ class Document(Base):
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 
+    outbound_provider_config_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey(f'{SCHEMA}.outbound_provider_configs.id')
+    )
+    outbound_provider_generation: Mapped[int | None] = mapped_column(Integer)
+
     binding: Mapped[Binding | None] = relationship()
+    outbound_provider_config: Mapped[OutboundProviderConfig | None] = relationship()
     payments: Mapped[list[Payment]] = relationship(back_populates='document')
 
 

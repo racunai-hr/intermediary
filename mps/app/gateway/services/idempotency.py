@@ -5,7 +5,7 @@ from typing import Any, Callable
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.gateway.errors import idempotency_conflict
+from app.gateway.errors import GatewayError, idempotency_conflict
 from app.gateway.models import IdempotencyKey
 
 
@@ -43,7 +43,13 @@ def run_idempotent(
             raise idempotency_conflict()
         return row.http_status, row.response_body
 
-    status, body = action()
+    try:
+        status, body = action()
+    except GatewayError as exc:
+        if exc.code == 'PROVIDER_NOT_CONFIGURED':
+            session.delete(placeholder)
+            session.flush()
+        raise
     placeholder.http_status = status
     placeholder.response_body = body
     session.flush()

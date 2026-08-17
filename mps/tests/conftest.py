@@ -15,6 +15,8 @@ os.environ.setdefault('GATEWAY_JWT_ISS', 'racunai-api')
 os.environ.setdefault('GATEWAY_JWT_AUD', 'racunai-intermediary')
 
 TEST_OIB = '36619131370'
+# Never write outbound-provider rows against TEST_OIB (staging taxpayer).
+OUTBOUND_TEST_OIB = '11111111111'
 OTHER_OIB = '12345678901'
 
 
