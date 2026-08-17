@@ -22,6 +22,17 @@ postgresql+psycopg://racunai_intermediary:<secret>@postgis:5432/racunai_intermed
 
 ## Tests
 
+Image entrypoint is `alembic upgrade head && uvicorn`. Compose test runs must override it, or uvicorn starts and the container is later killed (`137`). The image does not include pytest, so use `--entrypoint sh` (or `--entrypoint pytest` only after installing `requirements-dev.txt`):
+
+```bash
+cd /opt/stacks/racunai.hr
+docker compose run --rm --no-deps --entrypoint sh \
+  -v /opt/stacks/racunai.hr/intermediary/mps:/app \
+  mps -c "pip install -q -r requirements-dev.txt && pytest -q --tb=short --ignore=tests/test_public_ingress.py"
+```
+
+Host-side equivalent:
+
 ```bash
 pip install -r mps/requirements-dev.txt
 cd mps

@@ -21,7 +21,7 @@ from tests.super_http import (
     UBL,
     credentials_json,
 )
-from tests.test_gateway_api import _headers
+from tests.test_gateway_api import _configure_outbound, _headers
 
 SUPER_OIB = '11111111111'
 FOREIGN_OIB = '22222222222'
@@ -88,21 +88,21 @@ def test_super_capabilities_true_without_credential(client):
     assert response.status_code == 200
     body = response.json()
     assert body['supports']['outbound_send'] is True
-    assert body['readiness']['credential_available'] is False
+    assert body['outbound_readiness']['ready'] is False
+    assert body['inbound_readiness']['active_binding'] is False
 
 
 @requires_postgres
 def test_capability_true_missing_credential_is_not_configured(client, super_env):
-    _activate(client, credential_ref=None)
-    response = _send(client)
-    assert response.status_code == 202
-    assert response.json()['processing']['reason'] == 'PROVIDER_NOT_CONFIGURED'
+    response = _send(client, oib=f'{uuid.uuid4().int % 10**11:011d}')
+    assert response.status_code == 409
+    assert response.json()['error']['code'] == 'PROVIDER_NOT_CONFIGURED'
     assert super_env.send_calls == 0
 
 
 @requires_postgres
 def test_two_workers_one_super_post(client, super_env, monkeypatch):
-    _activate(client)
+    _configure_outbound(client, oib=SUPER_OIB)
     monkeypatch.setattr('app.gateway.routes.v1.process_attempt', lambda *args, **kwargs: None)
     response = _send(client)
     assert response.status_code == 202
@@ -120,7 +120,7 @@ def test_db_transaction_not_open_during_http(client, super_env):
         seen.append(is_holding_db())
 
     super_client.before_request_hook = hook
-    _activate(client)
+    _configure_outbound(client, oib=SUPER_OIB)
     response = _send(client)
     assert response.status_code == 202
     assert response.json()['exchange_status'] == 'SUBMITTED'
@@ -131,7 +131,7 @@ def test_db_transaction_not_open_during_http(client, super_env):
 @requires_postgres
 def test_timeout_on_send_does_not_retry(client, super_env):
     super_env.send_response = httpx.ReadTimeout('slow')
-    _activate(client)
+    _configure_outbound(client, oib=SUPER_OIB)
     response = _send(client)
     assert response.status_code == 202
     body = response.json()
@@ -145,7 +145,7 @@ def test_timeout_on_send_does_not_retry(client, super_env):
 @requires_postgres
 def test_ambiguous_without_unique_proof_requires_review(client, super_env):
     super_env.send_response = {'ErrorMessage': None}
-    _activate(client)
+    _configure_outbound(client, oib=SUPER_OIB)
     response = _send(client)
     assert response.status_code == 202
     body = response.json()
@@ -226,7 +226,7 @@ def test_same_guid_other_company_does_not_collide(client, super_env):
 
 @requires_postgres
 def test_status_for_other_oib_does_not_update(client, super_env, db_session):
-    _activate(client)
+    _configure_outbound(client, oib=SUPER_OIB)
     sent = _send(client)
     document_id = sent.json()['document_id']
     from app.gateway.services.inbound_pull import apply_outbound_status_row
@@ -246,6 +246,7 @@ def test_status_for_other_oib_does_not_update(client, super_env, db_session):
 @requires_postgres
 def test_payment_and_reject_timeout_no_second_post(client, super_env):
     _activate(client)
+    _configure_outbound(client, oib=SUPER_OIB)
     sent = _send(client)
     document_id = sent.json()['document_id']
     super_env.payment_response = httpx.ReadTimeout('slow')

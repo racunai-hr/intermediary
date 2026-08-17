@@ -11,8 +11,9 @@ from app.gateway.adapters.super.adapter import SuperAdapter
 from app.gateway.adapters.super.mapping import MAPPING_VERSION, reject_reason_code
 from app.gateway.db import get_engine
 from app.gateway.errors import GatewayError
-from app.gateway.models import Binding, Document, Payment
+from app.gateway.models import Document, Payment
 from app.gateway.services import attempts as attempt_service
+from app.gateway.services.outbound_provider import get_actual, get_config
 from app.gateway.services.outbox import record_event
 
 logger = logging.getLogger(__name__)
@@ -64,13 +65,46 @@ def process_attempt(attempt_id: uuid.UUID | str) -> None:
             )
             session.commit()
             return
-        binding = session.get(Binding, document.binding_id) if document.binding_id else None
-        credential_ref = binding.credential_ref if binding else None
+        stamped = get_config(session, document.outbound_provider_config_id)
+        actual = get_actual(session, document.taxpayer_oib)
+        if document.direction == 'OUTBOUND' and not claimed.write_intended:
+            if actual is not None and actual.status == 'DISABLED':
+                document.processing_state = 'BLOCKED'
+                document.processing_reason = 'BLOCKED_PROVIDER_DISABLED'
+                attempt_service.release_unsent(session, claimed)
+                session.commit()
+                return
+            if stamped is None or not stamped.credential_ref:
+                document.processing_state = 'BLOCKED'
+                document.processing_reason = 'BLOCKED_CREDENTIAL_UNAVAILABLE'
+                attempt_service.release_unsent(session, claimed)
+                session.commit()
+                return
+        credential_ref = stamped.credential_ref if stamped else None
+        if document.direction != 'OUTBOUND':
+            from app.gateway.models import Binding
+
+            binding = session.get(Binding, document.binding_id) if document.binding_id else None
+            credential_ref = binding.credential_ref if binding else credential_ref
         try:
             credential = adapter.resolve(credential_ref)
-        except GatewayError as exc:
+        except GatewayError:
             document.processing_state = 'BLOCKED'
-            document.processing_reason = exc.code
+            document.processing_reason = (
+                'BLOCKED_CREDENTIAL_UNAVAILABLE'
+                if document.direction == 'OUTBOUND'
+                else 'PROVIDER_NOT_CONFIGURED'
+            )
+            attempt_service.release_unsent(session, claimed)
+            session.commit()
+            return
+        if (
+            document.direction == 'OUTBOUND'
+            and document.provider_account_key
+            and credential.company_guid != document.provider_account_key
+        ):
+            document.processing_state = 'BLOCKED'
+            document.processing_reason = 'BLOCKED_CREDENTIAL_UNAVAILABLE'
             attempt_service.release_unsent(session, claimed)
             session.commit()
             return
@@ -81,9 +115,10 @@ def process_attempt(attempt_id: uuid.UUID | str) -> None:
         invoice_guid = document.provider_invoice_guid
         payment = session.get(Payment, claimed.payment_id) if claimed.payment_id else None
         reject_payload = (document.provider_refs or {}).get('pending_rejection') or {}
-        document.provider_account_key = credential.company_guid
+        if document.direction != 'OUTBOUND':
+            document.provider_account_key = credential.company_guid
         refs = dict(document.provider_refs or {})
-        refs['company_guid'] = credential.company_guid
+        refs['company_guid'] = document.provider_account_key or credential.company_guid
         document.provider_refs = refs
         if claimed.is_write:
             attempt_service.mark_write_intended(session, claimed)
