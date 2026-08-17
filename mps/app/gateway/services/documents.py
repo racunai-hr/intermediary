@@ -7,13 +7,18 @@ from sqlalchemy.orm import Session
 
 from app.gateway.canonical import decode_cursor, encode_cursor, require_oib, sha256_text, validate_amount
 from app.gateway.errors import (
-    capability_not_supported,
     document_not_found,
     invalid_request,
     invalid_ubl,
 )
-from app.gateway.models import Document, Payment
+from app.gateway.models import Attempt, Document, Payment
 from app.gateway.services.bindings import require_active_binding
+from app.gateway.services.attempts import (
+    KIND_E_REPORTING_REJECT,
+    KIND_OUTBOUND_SEND,
+    KIND_PAYMENT,
+    create_attempt,
+)
 from app.gateway.services.outbox import record_event
 
 DOCUMENT_TYPES = {'INVOICE', 'CREDIT_NOTE'}
@@ -100,12 +105,18 @@ def create_outbound(session: Session, taxpayer_oib: str, payload: dict) -> dict:
         fiscalization_status='PENDING',
         recipient_status='PENDING',
         payment_status='UNPAID',
-        processing_state='BLOCKED',
-        processing_reason='CAPABILITY_NOT_SUPPORTED',
+        processing_state=None,
+        processing_reason=None,
         provider_refs={},
     )
     session.add(document)
     session.flush()
+    create_attempt(
+        session,
+        attempt_id=document.attempt_id,
+        kind=KIND_OUTBOUND_SEND,
+        document_id=document.document_id,
+    )
     record_event(
         session,
         event_type='outbound.exchange_status_changed',
@@ -139,7 +150,7 @@ def add_payment(session: Session, document_id: str, payload: dict) -> dict:
         paid_at = paid_at.replace(tzinfo=timezone.utc)
     existing = session.get(Payment, payment_id)
     if existing is not None:
-        return _serialize_payment(existing)
+        return _serialize_payment(session, existing)
     payment = Payment(
         payment_id=payment_id,
         document_id=document.document_id,
@@ -149,12 +160,19 @@ def add_payment(session: Session, document_id: str, payload: dict) -> dict:
         payment_method=str(payload['payment_method']),
         settlement=payload['settlement'],
         fiscalization_status='PENDING',
-        processing_state='BLOCKED',
-        processing_reason='CAPABILITY_NOT_SUPPORTED',
+        processing_state='READY',
+        processing_reason='',
     )
     session.add(payment)
     document.payment_status = 'PARTIALLY_PAID' if payload['settlement'] == 'PARTIAL' else 'PAID'
     session.flush()
+    attempt = create_attempt(
+        session,
+        attempt_id=uuid.uuid4(),
+        kind=KIND_PAYMENT,
+        document_id=document.document_id,
+        payment_id=payment.payment_id,
+    )
     record_event(
         session,
         event_type='outbound.payment_status_changed',
@@ -162,13 +180,17 @@ def add_payment(session: Session, document_id: str, payload: dict) -> dict:
         document_id=document.document_id,
         payload={'payment_id': str(payment_id), 'payment_status': document.payment_status},
     )
-    return _serialize_payment(payment)
+    return _serialize_payment(session, payment, attempt.id)
 
 
-def _serialize_payment(payment: Payment) -> dict:
+def _serialize_payment(session: Session, payment: Payment, attempt_id: uuid.UUID | None = None) -> dict:
+    if attempt_id is None:
+        row = session.query(Attempt).filter_by(payment_id=payment.payment_id).one_or_none()
+        attempt_id = row.id if row else None
     return {
         'payment_id': str(payment.payment_id),
         'document_id': str(payment.document_id),
+        'attempt_id': str(attempt_id) if attempt_id else None,
         'paid_at': payment.paid_at.isoformat(),
         'amount': payment.amount,
         'currency': payment.currency,
@@ -215,18 +237,31 @@ def reject_e_reporting(session: Session, document_id: str, payload: dict) -> dic
     if not payload.get('reason_code'):
         raise invalid_request('reason_code is required.')
     document.e_reporting_status = 'PENDING'
-    document.processing_state = 'BLOCKED'
-    document.processing_reason = 'CAPABILITY_NOT_SUPPORTED'
+    document.processing_state = None
+    document.processing_reason = None
+    refs = dict(document.provider_refs or {})
+    refs['pending_rejection'] = {
+        'reason_code': payload.get('reason_code'),
+        'reason_text': payload.get('reason_text') or '',
+    }
+    document.provider_refs = refs
     session.flush()
+    attempt = create_attempt(
+        session,
+        attempt_id=uuid.uuid4(),
+        kind=KIND_E_REPORTING_REJECT,
+        document_id=document.document_id,
+    )
     record_event(
         session,
         event_type='inbound.e_reporting_status_changed',
         taxpayer_oib=document.taxpayer_oib,
         document_id=document.document_id,
-        payload={'reason_code': payload.get('reason_code')},
+        payload={'reason_code': payload.get('reason_code'), 'e_reporting_status': 'PENDING'},
     )
-    error = capability_not_supported('e-reporting rejection requires a provider adapter.')
-    return error.http_status, error.as_body()
+    body = serialize_document(document)
+    body['attempt_id'] = str(attempt.id)
+    return body
 
 
 def evidence(document: Document) -> dict:

@@ -52,3 +52,15 @@ def document_not_found(message: str = 'Document was not found.') -> GatewayError
 
 def requires_review(message: str) -> GatewayError:
     return GatewayError('REQUIRES_REVIEW', message, 409)
+
+
+def provider_not_configured(message: str = 'Provider credentials are not configured.') -> GatewayError:
+    return GatewayError('PROVIDER_NOT_CONFIGURED', message, 409)
+
+
+def provider_unavailable(message: str = 'Provider is temporarily unavailable.') -> GatewayError:
+    return GatewayError('PROVIDER_UNAVAILABLE', message, 503, retryable=True)
+
+
+def ambiguous_provider_result(message: str = 'Provider result is ambiguous.') -> GatewayError:
+    return GatewayError('AMBIGUOUS_PROVIDER_RESULT', message, 409)

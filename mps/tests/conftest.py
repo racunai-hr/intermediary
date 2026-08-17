@@ -26,6 +26,18 @@ def pytest_configure():
     url = postgres_url()
     if url:
         os.environ['GATEWAY_DATABASE_URL'] = url
+        from alembic import command
+        from alembic.config import Config
+
+        import sys
+
+        root = Path(__file__).resolve().parents[1]
+        if str(root) not in sys.path:
+            sys.path.insert(0, str(root))
+        cfg = Config(str(root / 'alembic.ini'))
+        cfg.set_main_option('script_location', str(root / 'alembic'))
+        cfg.set_main_option('sqlalchemy.url', url)
+        command.upgrade(cfg, 'head')
 
 
 requires_postgres = pytest.mark.skipif(

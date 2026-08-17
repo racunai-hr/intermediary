@@ -48,3 +48,23 @@ def run_idempotent(
     placeholder.response_body = body
     session.flush()
     return status, body
+
+
+def update_stored_response(
+    session: Session,
+    *,
+    principal: str,
+    key: str,
+    http_status: int,
+    body: dict[str, Any],
+) -> None:
+    row = (
+        session.query(IdempotencyKey)
+        .filter_by(service_principal=principal, key=key)
+        .one_or_none()
+    )
+    if row is None:
+        return
+    row.http_status = http_status
+    row.response_body = body
+    session.flush()

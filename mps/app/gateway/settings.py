@@ -12,6 +12,16 @@ class GatewaySettings(BaseSettings):
     jwt_iss: str = 'racunai-api'
     jwt_aud: str = 'racunai-intermediary'
     jwt_algorithm: str = 'HS256'
+    # Transitional secret backend. Replace with a real secret store; do not treat env JSON as permanent.
+    super_credentials_json: str = '{}'
+    super_lookup_credential_ref: str = ''
+    super_connect_timeout: float = 5.0
+    super_read_timeout: float = 30.0
+    super_write_timeout: float = 30.0
+    super_max_response_bytes: int = 5_000_000
+    super_token_skew_seconds: int = 60
+    super_lease_seconds: int = 60
+    super_poll_overlap_days: int = 2
 
     @field_validator('database_url')
     @classmethod
