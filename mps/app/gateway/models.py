@@ -55,7 +55,25 @@ class Binding(Base):
 
 class Document(Base):
     __tablename__ = 'documents'
-    __table_args__ = {'schema': SCHEMA}
+    __table_args__ = (
+        Index(
+            'uq_gateway_inbound_provider_account_guid',
+            'bound_provider',
+            'provider_account_key',
+            'provider_invoice_guid',
+            unique=True,
+            postgresql_where=text(
+                "direction = 'INBOUND' AND provider_invoice_guid IS NOT NULL"
+            ),
+        ),
+        Index(
+            'ix_gateway_documents_provider_invoice',
+            'bound_provider',
+            'provider_account_key',
+            'provider_invoice_guid',
+        ),
+        {'schema': SCHEMA},
+    )
 
     document_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
     taxpayer_oib: Mapped[str] = mapped_column(String(11), nullable=False, index=True)
@@ -79,6 +97,8 @@ class Document(Base):
     processing_state: Mapped[str | None] = mapped_column(String(32))
     processing_reason: Mapped[str | None] = mapped_column(String(64))
     provider_refs: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    provider_account_key: Mapped[str | None] = mapped_column(String(64))
+    provider_invoice_guid: Mapped[str | None] = mapped_column(String(64))
     cursor_seq: Mapped[int] = mapped_column(BigInteger, Identity(), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
@@ -158,5 +178,60 @@ class OutboxEvent(Base):
     document_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     payload: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class Attempt(Base):
+    __tablename__ = 'attempts'
+    __table_args__ = (
+        Index('ix_gateway_attempts_document_id', 'document_id'),
+        {'schema': SCHEMA},
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey(f'{SCHEMA}.documents.document_id'), nullable=False
+    )
+    payment_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    is_write: Mapped[bool] = mapped_column(nullable=False, default=True)
+    write_intended: Mapped[bool] = mapped_column(nullable=False, default=False)
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    lease_owner: Mapped[str | None] = mapped_column(String(64))
+    result_code: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class PollCheckpoint(Base):
+    __tablename__ = 'poll_checkpoints'
+    __table_args__ = (
+        UniqueConstraint(
+            'taxpayer_oib',
+            'provider',
+            'account_key',
+            'kind',
+            name='uq_gateway_poll_checkpoint',
+        ),
+        {'schema': SCHEMA},
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    taxpayer_oib: Mapped[str] = mapped_column(String(11), nullable=False)
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    account_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    watermark_date: Mapped[str | None] = mapped_column(String(10))
+    last_unique_id: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

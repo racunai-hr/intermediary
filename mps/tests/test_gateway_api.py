@@ -92,7 +92,7 @@ def test_outbound_blocked_and_idempotent_replay(client):
     assert first.status_code == 202
     body = first.json()
     assert body['exchange_status'] == 'QUEUED'
-    assert body['processing'] == {'state': 'BLOCKED', 'reason': 'CAPABILITY_NOT_SUPPORTED'}
+    assert body['processing'] == {'state': 'BLOCKED', 'reason': 'PROVIDER_NOT_CONFIGURED'}
     second = client.post('/v1/outbound/documents', json=payload, headers=_headers(key))
     assert second.status_code == 202
     assert second.json()['attempt_id'] == body['attempt_id']
@@ -206,7 +206,7 @@ def test_reconciliation_is_failed_not_completed(client):
     assert response.status_code == 202
     body = response.json()
     assert body['status'] == 'FAILED'
-    assert body['error']['code'] == 'CAPABILITY_NOT_SUPPORTED'
+    assert body['error']['code'] == 'PROVIDER_NOT_CONFIGURED'
     assert body['error']['retryable'] is False
     fetched = client.get(
         f'/v1/reconciliations/{body["reconciliation_id"]}',

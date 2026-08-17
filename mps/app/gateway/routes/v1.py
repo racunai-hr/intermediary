@@ -4,11 +4,13 @@ from typing import Any
 from fastapi import APIRouter, Depends, Header, Request, Response
 from sqlalchemy.orm import Session
 
-from app.gateway.adapters.base import UnimplementedAdapter
+from app.gateway.adapters.registry import get_adapter
+from app.gateway.adapters.super.adapter import SuperAdapter
 from app.gateway.auth import Principal, require_scope, require_taxpayer
 from app.gateway.canonical import request_hash, require_oib
-from app.gateway.db import get_session
-from app.gateway.errors import capability_not_supported, invalid_request
+from app.gateway.db import get_engine, get_session
+from app.gateway.errors import capability_not_supported, invalid_request, provider_not_configured
+from app.gateway.models import Payment
 from app.gateway.services import documents as document_service
 from app.gateway.services.bindings import (
     confirm_binding,
@@ -16,13 +18,16 @@ from app.gateway.services.bindings import (
     put_binding,
     serialize_binding,
 )
+from app.gateway.services.dispatch import process_attempt
 from app.gateway.services.documents import serialize_document
-from app.gateway.services.idempotency import run_idempotent
+from app.gateway.services.idempotency import run_idempotent, update_stored_response
 from app.gateway.services.reconcile import (
     get_reconciliation,
+    run_reconciliation,
     serialize_reconciliation,
     start_reconciliation,
 )
+from app.gateway.settings import get_gateway_settings
 
 router = APIRouter(prefix='/v1')
 
@@ -38,15 +43,56 @@ def _json(response: Response, status: int, body: dict) -> dict:
     return body
 
 
+def _dispatch_write(session: Session, principal: str, key: str, status: int, body: dict, kind: str) -> tuple[int, dict]:
+    session.commit()
+    if kind == 'reconciliation':
+        from sqlalchemy.orm import sessionmaker
+
+        run_reconciliation(sessionmaker(bind=get_engine(), expire_on_commit=False), body['reconciliation_id'])
+        session.expire_all()
+        job = get_reconciliation(session, body['reconciliation_id'])
+        body = serialize_reconciliation(job)
+    elif body.get('attempt_id'):
+        process_attempt(body['attempt_id'])
+        session.expire_all()
+        if kind == 'payment' and body.get('payment_id'):
+            from uuid import UUID
+
+            payment = session.get(Payment, UUID(str(body['payment_id'])))
+            if payment is not None:
+                body = document_service._serialize_payment(session, payment)
+        elif body.get('document_id'):
+            document = document_service.get_document(session, body['document_id'])
+            refreshed = serialize_document(document)
+            if kind == 'reject':
+                refreshed['attempt_id'] = body['attempt_id']
+            body = refreshed
+    update_stored_response(session, principal=principal, key=key, http_status=status, body=body)
+    return status, body
+
+
 @router.get('/providers/{provider}/capabilities')
 def provider_capabilities(
     provider: str,
+    taxpayer_oib: str | None = None,
     principal: Principal = Depends(require_scope('gateway.read')),
+    session: Session = Depends(get_session),
 ):
     if provider == 'racunai_direct':
         raise capability_not_supported('racunai_direct is disabled for this API version.')
-    caps = UnimplementedAdapter().capabilities()
-    return {'provider': provider, **caps}
+    adapter = get_adapter(provider)
+    caps = adapter.capabilities()
+    readiness = {
+        'configured': False,
+        'active_binding': False,
+        'credential_available': False,
+    }
+    if taxpayer_oib and isinstance(adapter, SuperAdapter):
+        require_oib(taxpayer_oib)
+        require_taxpayer(principal, taxpayer_oib)
+        binding = next((item for item in list_bindings(session, taxpayer_oib) if item.status == 'ACTIVE'), None)
+        readiness = adapter.readiness(binding)
+    return {'provider': provider, **caps, 'readiness': readiness}
 
 
 @router.get('/taxpayers/{oib}/inbound-binding')
@@ -119,14 +165,37 @@ def confirm_inbound_binding(
     return _json(response, status, body)
 
 
+def _super_participant(scheme: str, identifier: str) -> tuple[str, str]:
+    if ':' in identifier:
+        prefix, value = identifier.split(':', 1)
+        return prefix, value
+    if scheme.startswith('iso6523'):
+        return '9934', identifier
+    return scheme, identifier
+
+
 @router.post('/participants/lookup')
 def lookup_participant(
     payload: dict[str, Any],
     principal: Principal = Depends(require_scope('gateway.write')),
+    session: Session = Depends(get_session),
 ):
     if not payload.get('scheme') or not payload.get('identifier') or not payload.get('document_type'):
         raise invalid_request('scheme, identifier and document_type are required.')
-    raise capability_not_supported('Participant lookup requires a provider adapter.')
+    adapter = SuperAdapter()
+    credential_ref = None
+    taxpayer_oib = payload.get('taxpayer_oib')
+    if taxpayer_oib:
+        require_oib(str(taxpayer_oib))
+        require_taxpayer(principal, str(taxpayer_oib))
+        binding = next((item for item in list_bindings(session, str(taxpayer_oib)) if item.status == 'ACTIVE'), None)
+        credential_ref = binding.credential_ref if binding else None
+    credential_ref = credential_ref or get_gateway_settings().super_lookup_credential_ref
+    if not credential_ref:
+        raise provider_not_configured('Participant lookup has no credential_ref.')
+    credential = adapter.resolve(credential_ref)
+    scheme, identifier = _super_participant(str(payload['scheme']), str(payload['identifier']))
+    return adapter.lookup(credential, scheme, identifier)
 
 
 @router.post('/outbound/documents')
@@ -158,6 +227,7 @@ def create_outbound_document(
         ),
         action=action,
     )
+    status, body = _dispatch_write(session, principal.subject, key, status, body, 'outbound')
     return _json(response, status, body)
 
 
@@ -197,6 +267,7 @@ def create_payment(
         ),
         action=action,
     )
+    status, body = _dispatch_write(session, principal.subject, key, status, body, 'payment')
     return _json(response, status, body)
 
 
@@ -288,7 +359,7 @@ def reject_inbound(
     require_taxpayer(principal, document.taxpayer_oib)
 
     def action():
-        return document_service.reject_e_reporting(session, document_id, payload)
+        return 202, document_service.reject_e_reporting(session, document_id, payload)
 
     status, body = run_idempotent(
         session,
@@ -299,6 +370,7 @@ def reject_inbound(
         ),
         action=action,
     )
+    status, body = _dispatch_write(session, principal.subject, key, status, body, 'reject')
     return _json(response, status, body)
 
 
@@ -326,6 +398,7 @@ def create_reconciliation(
         ),
         action=action,
     )
+    status, body = _dispatch_write(session, principal.subject, key, status, body, 'reconciliation')
     return _json(response, status, body)
 
 
