@@ -138,7 +138,7 @@ def upsert_inbound_binding(
         binding = put_binding(session, oib, payload)
         return 200, serialize_binding(binding)
 
-    status, body = run_idempotent(
+    status, body, _owned = run_idempotent(
         session,
         principal=principal.subject,
         key=key,
@@ -167,7 +167,7 @@ def confirm_inbound_binding(
         binding = confirm_binding(session, oib, payload)
         return 200, serialize_binding(binding)
 
-    status, body = run_idempotent(
+    status, body, _owned = run_idempotent(
         session,
         principal=principal.subject,
         key=key,
@@ -207,7 +207,7 @@ def upsert_outbound_provider(
         config = put_outbound_provider(session, oib, payload, created_by=principal.subject)
         return 200, serialize_config(config)
 
-    status, body = run_idempotent(
+    status, body, _owned = run_idempotent(
         session,
         principal=principal.subject,
         key=key,
@@ -271,7 +271,7 @@ def create_outbound_document(
         body = document_service.create_outbound(session, oib, payload)
         return 202, body
 
-    status, body = run_idempotent(
+    status, body, owned = run_idempotent(
         session,
         principal=principal.subject,
         key=key,
@@ -284,7 +284,8 @@ def create_outbound_document(
         ),
         action=action,
     )
-    status, body = _dispatch_write(session, principal.subject, key, status, body, 'outbound')
+    if owned:
+        status, body = _dispatch_write(session, principal.subject, key, status, body, 'outbound')
     return _json(response, status, body)
 
 
@@ -315,7 +316,7 @@ def create_payment(
     def action():
         return 202, document_service.add_payment(session, document_id, payload)
 
-    status, body = run_idempotent(
+    status, body, owned = run_idempotent(
         session,
         principal=principal.subject,
         key=key,
@@ -324,7 +325,8 @@ def create_payment(
         ),
         action=action,
     )
-    status, body = _dispatch_write(session, principal.subject, key, status, body, 'payment')
+    if owned:
+        status, body = _dispatch_write(session, principal.subject, key, status, body, 'payment')
     return _json(response, status, body)
 
 
@@ -390,7 +392,7 @@ def set_workflow_status(
     def action():
         return 200, document_service.set_workflow(session, document_id, payload)
 
-    status, body = run_idempotent(
+    status, body, _owned = run_idempotent(
         session,
         principal=principal.subject,
         key=key,
@@ -418,7 +420,7 @@ def reject_inbound(
     def action():
         return 202, document_service.reject_e_reporting(session, document_id, payload)
 
-    status, body = run_idempotent(
+    status, body, owned = run_idempotent(
         session,
         principal=principal.subject,
         key=key,
@@ -427,7 +429,8 @@ def reject_inbound(
         ),
         action=action,
     )
-    status, body = _dispatch_write(session, principal.subject, key, status, body, 'reject')
+    if owned:
+        status, body = _dispatch_write(session, principal.subject, key, status, body, 'reject')
     return _json(response, status, body)
 
 
@@ -446,7 +449,7 @@ def create_reconciliation(
     def action():
         return 202, start_reconciliation(session, oib)
 
-    status, body = run_idempotent(
+    status, body, owned = run_idempotent(
         session,
         principal=principal.subject,
         key=key,
@@ -455,7 +458,8 @@ def create_reconciliation(
         ),
         action=action,
     )
-    status, body = _dispatch_write(session, principal.subject, key, status, body, 'reconciliation')
+    if owned:
+        status, body = _dispatch_write(session, principal.subject, key, status, body, 'reconciliation')
     return _json(response, status, body)
 
 
