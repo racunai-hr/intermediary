@@ -16,7 +16,7 @@ def run_idempotent(
     key: str,
     request_hash: str,
     action: Callable[[], tuple[int, dict[str, Any]]],
-) -> tuple[int, dict[str, Any]]:
+) -> tuple[int, dict[str, Any], bool]:
     placeholder = IdempotencyKey(
         service_principal=principal,
         key=key,
@@ -41,7 +41,7 @@ def run_idempotent(
         )
         if row.request_hash != request_hash:
             raise idempotency_conflict()
-        return row.http_status, row.response_body
+        return row.http_status, row.response_body, False
 
     try:
         status, body = action()
@@ -53,7 +53,7 @@ def run_idempotent(
     placeholder.http_status = status
     placeholder.response_body = body
     session.flush()
-    return status, body
+    return status, body, True
 
 
 def update_stored_response(

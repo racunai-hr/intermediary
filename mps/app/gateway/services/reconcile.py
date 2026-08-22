@@ -123,9 +123,9 @@ def run_reconciliation(session_factory, reconciliation_id) -> None:
         session.commit()
     except Exception:
         session.rollback()
-        session.close()
         raise
-    session.close()
+    finally:
+        session.close()
 
     inbound_error = inbound_setup_error
     outbound_error = None
