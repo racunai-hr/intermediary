@@ -37,12 +37,14 @@ def checkpoint_filters(session: Session, oib: str, account_key: str, kind: str) 
         session.flush()
     overlap = get_gateway_settings().super_poll_overlap_days
     end = _today()
-    if row.watermark_date:
+    if row.last_unique_id is None:
+        start = end - timedelta(days=400)
+        unique_from = 1
+    elif row.watermark_date:
         start = date.fromisoformat(row.watermark_date) - timedelta(days=overlap)
+        unique_from = max(1, row.last_unique_id - 50)
     else:
         start = end - timedelta(days=max(overlap, 7))
-    unique_from = None
-    if row.last_unique_id is not None:
         unique_from = max(1, row.last_unique_id - 50)
     return row, {
         'date_from': start.isoformat(),
