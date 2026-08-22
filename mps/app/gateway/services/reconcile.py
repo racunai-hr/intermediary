@@ -114,7 +114,10 @@ def run_reconciliation(session_factory, reconciliation_id) -> None:
             adapter = get_adapter(config.provider)
             if not isinstance(adapter, SuperAdapter):
                 continue
-            credential = adapter.resolve(config.credential_ref)
+            try:
+                credential = adapter.resolve(config.credential_ref)
+            except GatewayError:
+                continue
             if docs[0].provider_account_key and credential.company_guid != docs[0].provider_account_key:
                 continue
             guids = [doc.provider_invoice_guid for doc in docs if doc.provider_invoice_guid]
