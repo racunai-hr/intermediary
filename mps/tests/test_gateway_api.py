@@ -338,6 +338,61 @@ def test_payment_validation_and_existing_outbound_only(client, monkeypatch):
 
 
 @requires_postgres
+def test_payment_id_rejects_other_document(client, monkeypatch):
+    from app.gateway.settings import get_gateway_settings
+    from tests.super_http import credentials_json
+
+    monkeypatch.setenv('GATEWAY_SUPER_CREDENTIALS_JSON', credentials_json())
+    get_gateway_settings.cache_clear()
+    monkeypatch.setattr('app.gateway.routes.v1.process_attempt', lambda *args, **kwargs: None)
+    _configure_outbound(client)
+    first_id = str(uuid.uuid4())
+    second_id = str(uuid.uuid4())
+    payment_id = str(uuid.uuid4())
+    payload = {
+        'payment_id': payment_id,
+        'paid_at': '2026-08-16T12:00:00Z',
+        'amount': '10.00',
+        'currency': 'EUR',
+        'payment_method': 'BANK_TRANSFER',
+        'settlement': 'FULL',
+    }
+    for document_id in (first_id, second_id):
+        created = client.post(
+            '/v1/outbound/documents',
+            json={
+                'document_id': document_id,
+                'taxpayer_oib': OUTBOUND_TEST_OIB,
+                'direction': 'OUTBOUND',
+                'document_type': 'INVOICE',
+                'ubl': UBL,
+            },
+            headers=_headers(str(uuid.uuid4())),
+        )
+        assert created.status_code == 202, created.text
+    first_payment = client.post(
+        f'/v1/outbound/documents/{first_id}/payments',
+        json=payload,
+        headers=_headers(str(uuid.uuid4())),
+    )
+    assert first_payment.status_code == 202, first_payment.text
+    clash = client.post(
+        f'/v1/outbound/documents/{second_id}/payments',
+        json=payload,
+        headers=_headers(str(uuid.uuid4())),
+    )
+    assert clash.status_code == 400
+    assert clash.json()['error']['code'] == 'INVALID_REQUEST'
+    replay = client.post(
+        f'/v1/outbound/documents/{first_id}/payments',
+        json=payload,
+        headers=_headers(str(uuid.uuid4())),
+    )
+    assert replay.status_code == 202, replay.text
+    assert replay.json()['payment_id'] == payment_id
+
+
+@requires_postgres
 def test_jwt_wrong_scope(client):
     response = client.get(
         f'/v1/taxpayers/{TEST_OIB}/inbound-binding',

@@ -10,6 +10,7 @@ from app.gateway.adapters.super.adapter import SuperAdapter
 from app.gateway.adapters.super.credentials import SuperCredential
 from app.gateway.adapters.super.mapping import MAPPING_VERSION, map_inbound_status, map_outbound_status
 from app.gateway.canonical import sha256_text
+from app.gateway.adapters.super.client import SuperHttpError
 from app.gateway.errors import GatewayError
 from app.gateway.models import Binding, Document, PollCheckpoint
 from app.gateway.services.outbox import record_event
@@ -65,7 +66,7 @@ def fetch_inbound_batch(adapter: SuperAdapter, credential: SuperCredential, filt
             continue
         try:
             ubl = adapter.get_inbound_ubl(credential, guid)
-        except GatewayError:
+        except (GatewayError, SuperHttpError):
             batch.append((item, None))
             continue
         batch.append((item, ubl))

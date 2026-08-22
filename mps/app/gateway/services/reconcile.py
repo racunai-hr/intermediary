@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from sqlalchemy.orm import Session
 
+from app.gateway.adapters.super.client import SuperHttpError
 from app.gateway.adapters.registry import get_adapter
 from app.gateway.adapters.super.adapter import SuperAdapter
 from app.gateway.canonical import require_oib
-from app.gateway.errors import GatewayError, document_not_found, invalid_request
+from app.gateway.errors import GatewayError, document_not_found, from_super_http_error, invalid_request
 from app.gateway.models import Binding, Document, Reconciliation
 from app.gateway.services.outbound_provider import get_config
 from app.gateway.services.inbound_pull import (
@@ -14,6 +15,38 @@ from app.gateway.services.inbound_pull import (
     fetch_inbound_batch,
     persist_inbound_batch,
 )
+
+
+def _provider_error(exc: Exception) -> GatewayError:
+    if isinstance(exc, GatewayError):
+        return exc
+    if isinstance(exc, SuperHttpError):
+        return from_super_http_error(exc)
+    raise TypeError(f'Unexpected provider error type: {type(exc)!r}')
+
+
+def _mark_reconciliation_failed(session_factory, reconciliation_id, exc: BaseException) -> None:
+    from uuid import UUID
+
+    ident = reconciliation_id if not isinstance(reconciliation_id, str) else UUID(reconciliation_id)
+    message = str(exc) or exc.__class__.__name__
+    session = session_factory()
+    try:
+        job = session.get(Reconciliation, ident)
+        if job is None:
+            session.commit()
+            return
+        if job.status == 'RUNNING':
+            job.status = 'FAILED'
+            job.error_code = 'INTERNAL_ERROR'
+            job.error_message = message
+            job.retryable = False
+            session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
 
 
 def start_reconciliation(session: Session, taxpayer_oib: str) -> dict:
@@ -98,35 +131,39 @@ def run_reconciliation(session_factory, reconciliation_id) -> None:
     outbound_error = None
     batch: list = []
     status_rows: list[tuple[str, dict]] = []
-    if inbound_credential is not None and inbound_filters is not None and inbound_adapter is not None:
-        try:
-            batch = fetch_inbound_batch(inbound_adapter, inbound_credential, inbound_filters)
-        except GatewayError as exc:
-            inbound_error = exc
-    grouped: dict[str, list] = {}
-    configs_by_id: dict = {}
-    for document, config in outbound_groups:
-        grouped.setdefault(str(config.id), []).append(document)
-        configs_by_id[str(config.id)] = config
     try:
-        for config_id, docs in grouped.items():
-            config = configs_by_id[config_id]
-            adapter = get_adapter(config.provider)
-            if not isinstance(adapter, SuperAdapter):
-                continue
+        if inbound_credential is not None and inbound_filters is not None and inbound_adapter is not None:
             try:
-                credential = adapter.resolve(config.credential_ref)
-            except GatewayError:
-                continue
-            if docs[0].provider_account_key and credential.company_guid != docs[0].provider_account_key:
-                continue
-            guids = [doc.provider_invoice_guid for doc in docs if doc.provider_invoice_guid]
-            if not guids:
-                continue
-            for item in adapter.list_outbound_statuses(credential, guids):
-                status_rows.append((docs[0].provider_account_key or credential.company_guid, item))
-    except GatewayError as exc:
-        outbound_error = exc
+                batch = fetch_inbound_batch(inbound_adapter, inbound_credential, inbound_filters)
+            except (GatewayError, SuperHttpError) as exc:
+                inbound_error = _provider_error(exc)
+        grouped: dict[str, list] = {}
+        configs_by_id: dict = {}
+        for document, config in outbound_groups:
+            grouped.setdefault(str(config.id), []).append(document)
+            configs_by_id[str(config.id)] = config
+        try:
+            for config_id, docs in grouped.items():
+                config = configs_by_id[config_id]
+                adapter = get_adapter(config.provider)
+                if not isinstance(adapter, SuperAdapter):
+                    continue
+                try:
+                    credential = adapter.resolve(config.credential_ref)
+                except GatewayError:
+                    continue
+                if docs[0].provider_account_key and credential.company_guid != docs[0].provider_account_key:
+                    continue
+                guids = [doc.provider_invoice_guid for doc in docs if doc.provider_invoice_guid]
+                if not guids:
+                    continue
+                for item in adapter.list_outbound_statuses(credential, guids):
+                    status_rows.append((docs[0].provider_account_key or credential.company_guid, item))
+        except (GatewayError, SuperHttpError) as exc:
+            outbound_error = _provider_error(exc)
+    except Exception as exc:
+        _mark_reconciliation_failed(session_factory, ident, exc)
+        raise
 
     session = session_factory()
     try:

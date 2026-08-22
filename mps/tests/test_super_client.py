@@ -6,7 +6,7 @@ import httpx
 import pytest
 
 from app.gateway.adapters.super import client as super_client
-from app.gateway.adapters.super.client import SuperHttpClient, format_payment_amount
+from app.gateway.adapters.super.client import SuperHttpClient, SuperHttpError, format_payment_amount
 from app.gateway.adapters.super.credentials import EnvJsonCredentialResolver, SuperCredential
 from app.gateway.adapters.super.xmlutil import decode_strict_b64, parse_ubl_xml
 from app.gateway.errors import GatewayError
@@ -99,6 +99,26 @@ def test_unknown_credential_fails_before_network():
         EnvJsonCredentialResolver().resolve('missing-ref')
     assert exc.value.code == 'PROVIDER_NOT_CONFIGURED'
     assert script.token_calls == 0
+
+
+def test_safe_read_429_stops_after_max_retries(monkeypatch):
+    monkeypatch.setenv('GATEWAY_SUPER_READ_429_MAX_RETRIES', '2')
+    get_gateway_settings.cache_clear()
+    calls = {'count': 0}
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        calls['count'] += 1
+        if request.url.path.endswith('/Token'):
+            return httpx.Response(429, headers={'Retry-After': '0'})
+        return httpx.Response(200, json={'ErrorMessage': None})
+
+    super_client.transport_factory = lambda: httpx.MockTransport(transport)
+    with SuperHttpClient(_credential()) as client:
+        with pytest.raises(SuperHttpError) as exc:
+            client.get_invoice_list()
+    assert exc.value.retryable is True
+    assert 'rate-limited a read' in str(exc.value)
+    assert calls['count'] == 3
 
 
 def test_http_base_url_is_rejected(monkeypatch):

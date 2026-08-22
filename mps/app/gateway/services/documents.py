@@ -157,6 +157,16 @@ def add_payment(session: Session, document_id: str, payload: dict) -> dict:
         paid_at = paid_at.replace(tzinfo=timezone.utc)
     existing = session.get(Payment, payment_id)
     if existing is not None:
+        if existing.document_id != document.document_id:
+            raise invalid_request('payment_id belongs to another document.')
+        if (
+            existing.amount != amount
+            or existing.currency != str(payload['currency'])
+            or existing.payment_method != str(payload['payment_method'])
+            or existing.settlement != payload['settlement']
+            or existing.paid_at != paid_at
+        ):
+            raise invalid_request('Existing payment identity cannot be changed.')
         return _serialize_payment(session, existing)
     payment = Payment(
         payment_id=payment_id,

@@ -22,6 +22,7 @@ class GatewaySettings(BaseSettings):
     super_token_skew_seconds: int = 60
     super_lease_seconds: int = 60
     super_poll_overlap_days: int = 2
+    super_read_429_max_retries: int = 5
 
     @field_validator('database_url')
     @classmethod

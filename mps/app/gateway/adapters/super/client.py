@@ -145,6 +145,7 @@ class SuperHttpClient:
         safe_read: bool,
         retried_401: bool = False,
         retried_connect: bool = False,
+        retried_429: int = 0,
     ) -> dict[str, Any]:
         if before_request_hook is not None:
             before_request_hook()
@@ -206,6 +207,13 @@ class SuperHttpClient:
             )
 
         if response.status_code == 429 and safe_read:
+            max_retries = get_gateway_settings().super_read_429_max_retries
+            if retried_429 >= max_retries:
+                raise SuperHttpError(
+                    'Provider rate-limited a read',
+                    ambiguous=False,
+                    retryable=True,
+                )
             retry_after = response.headers.get('Retry-After', '1')
             try:
                 delay = min(max(float(retry_after), 0), 5)
@@ -219,7 +227,8 @@ class SuperHttpClient:
                 authenticated=authenticated,
                 safe_read=True,
                 retried_401=retried_401,
-                retried_connect=True,
+                retried_connect=retried_connect,
+                retried_429=retried_429 + 1,
             )
 
         content = response.content

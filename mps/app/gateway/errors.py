@@ -64,3 +64,18 @@ def provider_unavailable(message: str = 'Provider is temporarily unavailable.') 
 
 def ambiguous_provider_result(message: str = 'Provider result is ambiguous.') -> GatewayError:
     return GatewayError('AMBIGUOUS_PROVIDER_RESULT', message, 409)
+
+
+def from_super_http_error(exc: Exception) -> GatewayError:
+    from app.gateway.adapters.super.client import SuperHttpError
+
+    if not isinstance(exc, SuperHttpError):
+        raise TypeError('Expected SuperHttpError.') from exc
+    if exc.ambiguous:
+        return ambiguous_provider_result(str(exc))
+    return GatewayError(
+        'PROVIDER_UNAVAILABLE',
+        str(exc),
+        503,
+        retryable=exc.retryable,
+    )

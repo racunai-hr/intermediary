@@ -295,6 +295,65 @@ def test_payment_and_reject_timeout_no_second_post(client, super_env):
 
 
 @requires_postgres
+def test_reconciliation_survives_inbound_list_timeout(client, super_env):
+    _activate(client)
+    super_env.invoices = [{'Guid': INVOICE_GUID, 'UniqueId': 10, 'InvoiceStatus': 10}]
+
+    def fail_list(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith('/api/Invoice/GetInvoiceList'):
+            raise httpx.ReadTimeout('slow')
+        return super_env(request)
+
+    super_client.transport_factory = lambda: httpx.MockTransport(fail_list)
+    response = client.post(
+        f'/v1/taxpayers/{SUPER_OIB}/reconciliations',
+        json={},
+        headers=_headers(str(uuid.uuid4()), taxpayers=['*']),
+    )
+    assert response.status_code == 202, response.text
+    body = response.json()
+    assert body['status'] in {'FAILED', 'COMPLETED_WITH_ERRORS'}
+    assert body['status'] != 'RUNNING'
+    fetched = client.get(
+        f'/v1/reconciliations/{body["reconciliation_id"]}',
+        headers=auth_header(scope='gateway.read', taxpayers=['*']),
+    )
+    assert fetched.json()['status'] != 'RUNNING'
+
+
+@requires_postgres
+def test_reconciliation_internal_error_failed_and_reraises(client, db_session, monkeypatch, super_env):
+    from uuid import UUID
+
+    from sqlalchemy.orm import sessionmaker
+
+    from app.gateway.db import get_engine
+    from app.gateway.models import Reconciliation
+    from app.gateway.services.reconcile import run_reconciliation, start_reconciliation
+
+    _activate(client)
+    body = start_reconciliation(db_session, SUPER_OIB)
+    db_session.commit()
+    job_id = body['reconciliation_id']
+
+    def boom(*args, **kwargs):
+        raise AttributeError('deliberate bug')
+
+    monkeypatch.setattr('app.gateway.services.reconcile.fetch_inbound_batch', boom)
+
+    factory = sessionmaker(bind=get_engine(), expire_on_commit=False)
+    with pytest.raises(AttributeError, match='deliberate bug'):
+        run_reconciliation(factory, job_id)
+
+    verify = factory()
+    job = verify.get(Reconciliation, UUID(job_id))
+    assert job.status == 'FAILED'
+    assert job.error_code == 'INTERNAL_ERROR'
+    assert 'deliberate bug' in job.error_message
+    verify.close()
+
+
+@requires_postgres
 def test_lookup_uses_super(client, super_env):
     _activate(client)
     response = client.post(
