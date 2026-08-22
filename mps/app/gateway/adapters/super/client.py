@@ -317,7 +317,12 @@ class SuperHttpClient:
         if guids:
             data['SendingInvoiceGuidList'] = ','.join(guids)
         payload = self._post('/api/SendingInvoice/GetSendingInvoiceStatuses', data, write=False)
-        return payload.get('SendingInvoiceStatuses') or payload.get('InvoiceStatuses') or []
+        return (
+            payload.get('SendingInvoiceStatuses')
+            or payload.get('sendingInvoiceStatuses')
+            or payload.get('InvoiceStatuses')
+            or []
+        )
 
     def get_invoice_list(
         self,
@@ -343,7 +348,7 @@ class SuperHttpClient:
         if unique_to is not None:
             data['UniqueIdTo'] = str(unique_to)
         payload = self._post('/api/Invoice/GetInvoiceList', data, write=False)
-        return payload.get('Invoices') or []
+        return payload.get('Invoices') or payload.get('invoices') or []
 
     def get_invoice_ubl(self, guid: str) -> str:
         payload = self._post('/api/Invoice/GetInvoice', {'Guid': guid}, write=False)
