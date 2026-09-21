@@ -23,6 +23,10 @@ class SuperCredential:
     password: str
     company_guid: str
 
+    @property
+    def account_key(self) -> str:
+        return self.company_guid
+
     def __repr__(self) -> str:
         return f'SuperCredential(credential_ref={self.credential_ref!r}, company_guid={self.company_guid!r})'
 

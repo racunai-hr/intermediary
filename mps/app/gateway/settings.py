@@ -14,6 +14,7 @@ class GatewaySettings(BaseSettings):
     jwt_algorithm: str = 'HS256'
     # Transitional secret backend. Replace with a real secret store; do not treat env JSON as permanent.
     super_credentials_json: str = '{}'
+    pondi_credentials_json: str = '{}'
     super_lookup_credential_ref: str = ''
     super_connect_timeout: float = 5.0
     super_read_timeout: float = 30.0

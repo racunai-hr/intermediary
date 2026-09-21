@@ -66,16 +66,22 @@ def ambiguous_provider_result(message: str = 'Provider result is ambiguous.') ->
     return GatewayError('AMBIGUOUS_PROVIDER_RESULT', message, 409)
 
 
-def from_super_http_error(exc: Exception) -> GatewayError:
-    from app.gateway.adapters.super.client import SuperHttpError
-
-    if not isinstance(exc, SuperHttpError):
-        raise TypeError('Expected SuperHttpError.') from exc
-    if exc.ambiguous:
+def from_provider_http_error(exc: Exception) -> GatewayError:
+    ambiguous = bool(getattr(exc, 'ambiguous', False))
+    retryable = bool(getattr(exc, 'retryable', False))
+    if ambiguous:
         return ambiguous_provider_result(str(exc))
     return GatewayError(
         'PROVIDER_UNAVAILABLE',
         str(exc),
         503,
-        retryable=exc.retryable,
+        retryable=retryable,
     )
+
+
+def from_super_http_error(exc: Exception) -> GatewayError:
+    from app.gateway.adapters.super.client import SuperHttpError
+
+    if not isinstance(exc, SuperHttpError):
+        raise TypeError('Expected SuperHttpError.') from exc
+    return from_provider_http_error(exc)

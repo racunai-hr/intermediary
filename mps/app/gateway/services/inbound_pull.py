@@ -6,11 +6,10 @@ from datetime import date, datetime, timedelta, timezone
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.gateway.adapters.pondi.client import PondiHttpError
 from app.gateway.adapters.super.adapter import SuperAdapter
-from app.gateway.adapters.super.credentials import SuperCredential
-from app.gateway.adapters.super.mapping import MAPPING_VERSION, map_inbound_status, map_outbound_status
-from app.gateway.canonical import sha256_text
 from app.gateway.adapters.super.client import SuperHttpError
+from app.gateway.canonical import sha256_text
 from app.gateway.errors import GatewayError
 from app.gateway.models import Binding, Document, PollCheckpoint
 from app.gateway.services.outbox import record_event
@@ -21,16 +20,36 @@ def _today() -> date:
     return datetime.now(timezone.utc).date()
 
 
-def checkpoint_filters(session: Session, oib: str, account_key: str, kind: str) -> tuple[PollCheckpoint, dict]:
+def _item_unique(item: dict) -> int | None:
+    unique = item.get('UniqueId') or item.get('uniqueId') or item.get('id')
+    if unique is None:
+        return None
+    try:
+        return int(unique)
+    except (TypeError, ValueError):
+        return None
+
+
+def _account_key(credential) -> str:
+    return getattr(credential, 'account_key', None) or getattr(credential, 'company_guid', '') or ''
+
+
+def checkpoint_filters(
+    session: Session,
+    oib: str,
+    account_key: str,
+    kind: str,
+    provider: str,
+) -> tuple[PollCheckpoint, dict]:
     row = (
         session.query(PollCheckpoint)
-        .filter_by(taxpayer_oib=oib, provider='super', account_key=account_key, kind=kind)
+        .filter_by(taxpayer_oib=oib, provider=provider, account_key=account_key, kind=kind)
         .one_or_none()
     )
     if row is None:
         row = PollCheckpoint(
             taxpayer_oib=oib,
-            provider='super',
+            provider=provider,
             account_key=account_key,
             kind=kind,
         )
@@ -56,44 +75,66 @@ def checkpoint_filters(session: Session, oib: str, account_key: str, kind: str) 
     }
 
 
-def fetch_inbound_batch(adapter: SuperAdapter, credential: SuperCredential, filters: dict) -> list[tuple[dict, str | None]]:
+def fetch_inbound_batch(adapter, credential, filters: dict) -> list[tuple[dict, str | None]]:
+    fetcher = getattr(adapter, 'fetch_inbound_with_ubl', None)
+    if callable(fetcher):
+        return fetcher(credential, **filters)
     invoices = adapter.list_inbound(credential, **filters)
     batch: list[tuple[dict, str | None]] = []
     for item in invoices:
-        guid = str(item.get('Guid') or item.get('guid') or '')
+        guid = adapter.list_item_id(item)
         if not guid:
             batch.append((item, None))
             continue
         try:
             ubl = adapter.get_inbound_ubl(credential, guid)
-        except (GatewayError, SuperHttpError):
+        except (GatewayError, SuperHttpError, PondiHttpError):
             batch.append((item, None))
             continue
         batch.append((item, ubl))
     return batch
 
 
+def fetch_outbound_batch(adapter, credential, filters: dict) -> list[tuple[dict, str | None]]:
+    fetcher = getattr(adapter, 'fetch_outbound_with_ubl', None)
+    if callable(fetcher):
+        return fetcher(credential, **filters)
+    return []
+
+
+def _document_type(item: dict) -> str:
+    raw = str(item.get('documentType') or item.get('document_type') or 'Invoice')
+    compact = raw.replace('_', '').replace('-', '').lower()
+    if compact == 'creditnote':
+        return 'CREDIT_NOTE'
+    return 'INVOICE'
+
+
 def persist_inbound_batch(
     session: Session,
     *,
     binding: Binding,
-    credential: SuperCredential,
+    credential,
     batch: list[tuple[dict, str | None]],
     checkpoint: PollCheckpoint,
+    adapter,
 ) -> dict:
     created = 0
     errors = 0
     max_unique = checkpoint.last_unique_id
+    account_key = _account_key(credential)
+    provider = adapter.name
+    mapping_version = getattr(adapter, 'mapping_version', '')
     for item, ubl in batch:
-        guid = str(item.get('Guid') or item.get('guid') or '')
+        guid = adapter.list_item_id(item)
         if not guid or ubl is None:
             errors += 1
             continue
         existing = (
             session.query(Document)
             .filter_by(
-                bound_provider='super',
-                provider_account_key=credential.company_guid,
+                bound_provider=provider,
+                provider_account_key=account_key,
                 provider_invoice_guid=guid,
                 direction='INBOUND',
             )
@@ -102,19 +143,19 @@ def persist_inbound_batch(
         if existing is not None:
             if existing.taxpayer_oib != binding.taxpayer_oib:
                 continue
-            _apply_inbound_status(session, existing, item, credential.company_guid)
-            unique = item.get('UniqueId') or item.get('uniqueId')
+            _apply_inbound_status(session, existing, item, account_key, adapter)
+            unique = _item_unique(item)
             if unique is not None:
-                max_unique = max(int(unique), max_unique or 0)
+                max_unique = max(unique, max_unique or 0)
             continue
-        mapped = map_inbound_status(item.get('InvoiceStatus') or item.get('invoiceStatus'))
+        mapped = adapter.map_inbound_item(item)
         document = Document(
             document_id=uuid.uuid4(),
             taxpayer_oib=binding.taxpayer_oib,
             direction='INBOUND',
             document_type='INVOICE',
             binding_id=binding.id,
-            bound_provider='super',
+            bound_provider=provider,
             ubl=ubl,
             ubl_sha256=sha256_text(ubl),
             attempt_id=uuid.uuid4(),
@@ -124,12 +165,12 @@ def persist_inbound_batch(
             e_reporting_status=mapped.e_reporting.value,
             processing_state='BLOCKED' if not mapped.known else None,
             processing_reason='REQUIRES_REVIEW' if not mapped.known else None,
-            provider_account_key=credential.company_guid,
+            provider_account_key=account_key,
             provider_invoice_guid=guid,
             provider_refs={
-                'company_guid': credential.company_guid,
+                'company_guid': account_key,
                 'invoice_guid': guid,
-                'mapping_version': MAPPING_VERSION,
+                'mapping_version': mapping_version,
                 'provider_status': {
                     'code': mapped.intake.provider_code,
                     'text': mapped.intake.provider_text,
@@ -144,15 +185,15 @@ def persist_inbound_batch(
             existing = (
                 session.query(Document)
                 .filter_by(
-                    bound_provider='super',
-                    provider_account_key=credential.company_guid,
+                    bound_provider=provider,
+                    provider_account_key=account_key,
                     provider_invoice_guid=guid,
                     direction='INBOUND',
                 )
                 .one_or_none()
             )
             if existing is not None and existing.taxpayer_oib == binding.taxpayer_oib:
-                _apply_inbound_status(session, existing, item, credential.company_guid)
+                _apply_inbound_status(session, existing, item, account_key, adapter)
             continue
         created += 1
         record_event(
@@ -162,9 +203,102 @@ def persist_inbound_batch(
             document_id=document.document_id,
             payload={'invoice_guid': guid},
         )
-        unique = item.get('UniqueId') or item.get('uniqueId')
+        unique = _item_unique(item)
         if unique is not None:
-            max_unique = max(int(unique), max_unique or 0)
+            max_unique = max(unique, max_unique or 0)
+    checkpoint.watermark_date = _today().isoformat()
+    if max_unique is not None:
+        checkpoint.last_unique_id = max_unique
+    checkpoint.updated_at = datetime.now(timezone.utc)
+    session.flush()
+    return {'created': created, 'errors': errors}
+
+
+def persist_historical_outbound_batch(
+    session: Session,
+    *,
+    taxpayer_oib: str,
+    credential,
+    batch: list[tuple[dict, str | None]],
+    checkpoint: PollCheckpoint,
+    adapter,
+    outbound_config=None,
+) -> dict:
+    """Store already-sent provider invoices. Never queues a send attempt."""
+    created = 0
+    errors = 0
+    max_unique = checkpoint.last_unique_id
+    account_key = _account_key(credential)
+    provider = adapter.name
+    mapping_version = getattr(adapter, 'mapping_version', '')
+    for item, ubl in batch:
+        guid = adapter.list_item_id(item)
+        if not guid or ubl is None:
+            errors += 1
+            continue
+        existing = (
+            session.query(Document)
+            .filter_by(
+                bound_provider=provider,
+                provider_account_key=account_key,
+                provider_invoice_guid=guid,
+                direction='OUTBOUND',
+            )
+            .order_by(Document.created_at.desc())
+            .first()
+        )
+        if existing is not None:
+            if existing.taxpayer_oib != taxpayer_oib:
+                continue
+            apply_outbound_status_row(
+                session,
+                taxpayer_oib=taxpayer_oib,
+                account_key=account_key,
+                item=item,
+                adapter=adapter,
+            )
+            unique = _item_unique(item)
+            if unique is not None:
+                max_unique = max(unique, max_unique or 0)
+            continue
+        mapped = adapter.map_outbound_item(item)
+        document = Document(
+            document_id=uuid.uuid4(),
+            taxpayer_oib=taxpayer_oib,
+            direction='OUTBOUND',
+            document_type=_document_type(item),
+            binding_id=None,
+            outbound_provider_config_id=getattr(outbound_config, 'id', None),
+            outbound_provider_generation=getattr(outbound_config, 'generation', None),
+            bound_provider=provider,
+            ubl=ubl,
+            ubl_sha256=sha256_text(ubl),
+            attempt_id=uuid.uuid4(),
+            exchange_status=mapped.exchange.value,
+            fiscalization_status=mapped.fiscalization.value,
+            recipient_status=mapped.recipient.value,
+            payment_status=mapped.payment.value,
+            processing_state='BLOCKED' if not mapped.known else None,
+            processing_reason='REQUIRES_REVIEW' if not mapped.known else None,
+            provider_account_key=account_key,
+            provider_invoice_guid=guid,
+            provider_refs={
+                'company_guid': account_key,
+                'invoice_guid': guid,
+                'mapping_version': mapping_version,
+                'historical_intake': True,
+                'provider_status': {
+                    'code': mapped.exchange.provider_code,
+                    'text': mapped.exchange.provider_text,
+                },
+            },
+        )
+        session.add(document)
+        session.flush()
+        created += 1
+        unique = _item_unique(item)
+        if unique is not None:
+            max_unique = max(unique, max_unique or 0)
     checkpoint.watermark_date = _today().isoformat()
     if max_unique is not None:
         checkpoint.last_unique_id = max_unique
@@ -179,14 +313,16 @@ def apply_outbound_status_row(
     taxpayer_oib: str,
     account_key: str,
     item: dict,
+    adapter=None,
 ) -> bool:
-    guid = str(item.get('Guid') or item.get('guid') or '')
+    mapper = adapter or SuperAdapter()
+    guid = mapper.list_item_id(item)
     if not guid:
         return False
     document = (
         session.query(Document)
         .filter_by(
-            bound_provider='super',
+            bound_provider=mapper.name,
             provider_account_key=account_key,
             provider_invoice_guid=guid,
             direction='OUTBOUND',
@@ -197,13 +333,13 @@ def apply_outbound_status_row(
     )
     if document is None:
         return False
-    mapped = map_outbound_status(item.get('SendingInvoiceStatus') or item.get('sendingInvoiceStatus'))
+    mapped = mapper.map_outbound_item(item)
     document.exchange_status = mapped.exchange.value
     document.fiscalization_status = mapped.fiscalization.value
     document.recipient_status = mapped.recipient.value
     document.payment_status = mapped.payment.value
     refs = dict(document.provider_refs or {})
-    refs['mapping_version'] = MAPPING_VERSION
+    refs['mapping_version'] = getattr(mapper, 'mapping_version', '')
     refs['provider_status'] = {
         'code': mapped.exchange.provider_code,
         'text': mapped.exchange.provider_text,
@@ -223,13 +359,13 @@ def apply_outbound_status_row(
     return True
 
 
-def _apply_inbound_status(session: Session, document: Document, item: dict, account_key: str) -> None:
+def _apply_inbound_status(session: Session, document: Document, item: dict, account_key: str, adapter) -> None:
     if document.provider_account_key != account_key:
         return
-    mapped = map_inbound_status(item.get('InvoiceStatus') or item.get('invoiceStatus'))
+    mapped = adapter.map_inbound_item(item)
     document.intake_status = mapped.intake.value
     refs = dict(document.provider_refs or {})
-    refs['mapping_version'] = MAPPING_VERSION
+    refs['mapping_version'] = getattr(adapter, 'mapping_version', '')
     refs['provider_status'] = {
         'code': mapped.intake.provider_code,
         'text': mapped.intake.provider_text,

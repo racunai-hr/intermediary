@@ -2,13 +2,19 @@ from __future__ import annotations
 
 from app.gateway.adapters.super.client import SuperCallResult, SuperHttpClient
 from app.gateway.adapters.super.credentials import CredentialResolver, SuperCredential, default_resolver
-from app.gateway.adapters.super.mapping import ubl_document_type
+from app.gateway.adapters.super.mapping import (
+    MAPPING_VERSION,
+    map_inbound_status,
+    map_outbound_status,
+    ubl_document_type,
+)
 from app.gateway.errors import capability_not_supported, provider_not_configured
 from app.gateway.models import Binding
 
 
 class SuperAdapter:
     name = 'super'
+    mapping_version = MAPPING_VERSION
 
     def __init__(self, resolver: CredentialResolver | None = None):
         self.resolver = resolver or default_resolver()
@@ -97,7 +103,20 @@ class SuperAdapter:
 
     def list_outbound_statuses(self, credential: SuperCredential, guids: list[str], **filters) -> list[dict]:
         with SuperHttpClient(credential) as client:
-            return client.get_sending_invoice_statuses(guids, **filters)
+            return client.get_sending_invoice_statuses(
+                guids,
+                date_from=filters.get('date_from'),
+                date_to=filters.get('date_to'),
+            )
+
+    def list_item_id(self, item: dict) -> str:
+        return str(item.get('Guid') or item.get('guid') or '')
+
+    def map_inbound_item(self, item: dict):
+        return map_inbound_status(item.get('InvoiceStatus') or item.get('invoiceStatus'))
+
+    def map_outbound_item(self, item: dict):
+        return map_outbound_status(item.get('SendingInvoiceStatus') or item.get('sendingInvoiceStatus'))
 
 
 def require_super_credential(adapter: SuperAdapter, credential_ref: str | None) -> SuperCredential:

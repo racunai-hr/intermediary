@@ -4,6 +4,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, Header, Request, Response
 from sqlalchemy.orm import Session
 
+from app.gateway.adapters.base import UnimplementedAdapter
 from app.gateway.adapters.registry import get_adapter
 from app.gateway.adapters.super.adapter import SuperAdapter
 from app.gateway.auth import Principal, require_scope, require_taxpayer
@@ -239,15 +240,19 @@ def lookup_participant(
 ):
     if not payload.get('scheme') or not payload.get('identifier') or not payload.get('document_type'):
         raise invalid_request('scheme, identifier and document_type are required.')
-    adapter = SuperAdapter()
+    adapter = None
     credential_ref = None
     taxpayer_oib = payload.get('taxpayer_oib')
     if taxpayer_oib:
         require_oib(str(taxpayer_oib))
         require_taxpayer(principal, str(taxpayer_oib))
         binding = next((item for item in list_bindings(session, str(taxpayer_oib)) if item.status == 'ACTIVE'), None)
-        credential_ref = binding.credential_ref if binding else None
-    credential_ref = credential_ref or get_gateway_settings().super_lookup_credential_ref
+        if binding is not None:
+            adapter = get_adapter(binding.provider)
+            credential_ref = binding.credential_ref
+    if adapter is None or isinstance(adapter, UnimplementedAdapter) or not hasattr(adapter, 'lookup'):
+        adapter = SuperAdapter()
+        credential_ref = credential_ref or get_gateway_settings().super_lookup_credential_ref
     if not credential_ref:
         raise provider_not_configured('Participant lookup has no credential_ref.')
     credential = adapter.resolve(credential_ref)
@@ -300,6 +305,17 @@ def get_outbound_document(
     return serialize_document(document)
 
 
+@router.get('/outbound/documents/{document_id}/ubl')
+def get_outbound_ubl(
+    document_id: str,
+    principal: Principal = Depends(require_scope('gateway.read')),
+    session: Session = Depends(get_session),
+):
+    document = document_service.get_document(session, document_id, 'OUTBOUND')
+    require_taxpayer(principal, document.taxpayer_oib)
+    return Response(content=document.ubl, media_type='application/xml')
+
+
 @router.post('/outbound/documents/{document_id}/payments')
 def create_payment(
     document_id: str,
@@ -341,6 +357,19 @@ def list_inbound_documents(
     require_oib(oib)
     require_taxpayer(principal, oib)
     return document_service.list_inbound(session, oib, cursor, limit)
+
+
+@router.get('/taxpayers/{oib}/outbound/documents')
+def list_outbound_documents(
+    oib: str,
+    cursor: str | None = None,
+    limit: int = 50,
+    principal: Principal = Depends(require_scope('gateway.read')),
+    session: Session = Depends(get_session),
+):
+    require_oib(oib)
+    require_taxpayer(principal, oib)
+    return document_service.list_outbound(session, oib, cursor, limit)
 
 
 @router.get('/inbound/documents/{document_id}')
