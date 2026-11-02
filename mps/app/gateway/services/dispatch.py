@@ -6,9 +6,8 @@ import uuid
 
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.gateway.adapters.registry import get_adapter
-from app.gateway.adapters.super.adapter import SuperAdapter
-from app.gateway.adapters.super.mapping import MAPPING_VERSION, reject_reason_code
+from app.gateway.adapters.registry import adapter_is_live, get_adapter
+from app.gateway.adapters.super.mapping import reject_reason_code
 from app.gateway.db import get_engine
 from app.gateway.errors import GatewayError
 from app.gateway.models import Document, Payment
@@ -33,9 +32,9 @@ def is_holding_db() -> bool:
     return bool(getattr(holding_db, 'value', False))
 
 
-def _provider_refs(document: Document) -> dict:
+def _provider_refs(document: Document, adapter) -> dict:
     refs = dict(document.provider_refs or {})
-    refs['mapping_version'] = MAPPING_VERSION
+    refs['mapping_version'] = getattr(adapter, 'mapping_version', '')
     return refs
 
 
@@ -57,7 +56,7 @@ def process_attempt(attempt_id: uuid.UUID | str) -> None:
             session.commit()
             return
         adapter = get_adapter(document.bound_provider)
-        if not isinstance(adapter, SuperAdapter):
+        if not adapter_is_live(adapter):
             document.processing_state = 'BLOCKED'
             document.processing_reason = 'CAPABILITY_NOT_SUPPORTED'
             attempt_service.finish_attempt(
@@ -101,7 +100,7 @@ def process_attempt(attempt_id: uuid.UUID | str) -> None:
         if (
             document.direction == 'OUTBOUND'
             and document.provider_account_key
-            and credential.company_guid != document.provider_account_key
+            and credential.account_key != document.provider_account_key
         ):
             document.processing_state = 'BLOCKED'
             document.processing_reason = 'BLOCKED_CREDENTIAL_UNAVAILABLE'
@@ -116,9 +115,9 @@ def process_attempt(attempt_id: uuid.UUID | str) -> None:
         payment = session.get(Payment, claimed.payment_id) if claimed.payment_id else None
         reject_payload = (document.provider_refs or {}).get('pending_rejection') or {}
         if document.direction != 'OUTBOUND':
-            document.provider_account_key = credential.company_guid
+            document.provider_account_key = credential.account_key
         refs = dict(document.provider_refs or {})
-        refs['company_guid'] = document.provider_account_key or credential.company_guid
+        refs['company_guid'] = document.provider_account_key or credential.account_key
         document.provider_refs = refs
         if claimed.is_write:
             attempt_service.mark_write_intended(session, claimed)
@@ -178,7 +177,7 @@ def process_attempt(attempt_id: uuid.UUID | str) -> None:
         if attempt is None or document is None:
             session.commit()
             return
-        _commit_result(session, attempt, document, payment, kind, result, apply_error)
+        _commit_result(session, attempt, document, payment, kind, result, apply_error, adapter)
         session.commit()
     except Exception:
         session.rollback()
@@ -188,7 +187,7 @@ def process_attempt(attempt_id: uuid.UUID | str) -> None:
         _set_holding(False)
 
 
-def _commit_result(session, attempt, document, payment, kind, result, apply_error) -> None:
+def _commit_result(session, attempt, document, payment, kind, result, apply_error, adapter) -> None:
     if apply_error == 'REQUIRES_REVIEW':
         document.processing_state = 'BLOCKED'
         document.processing_reason = 'REQUIRES_REVIEW'
@@ -259,7 +258,7 @@ def _commit_result(session, attempt, document, payment, kind, result, apply_erro
                 payload={'processing': 'REQUIRES_REVIEW'},
             )
             return
-        refs = _provider_refs(document)
+        refs = _provider_refs(document, adapter)
         refs['invoice_guid'] = result.invoice_guid
         refs['company_guid'] = (document.provider_refs or {}).get('company_guid')
         if result.unique_id:
@@ -299,7 +298,7 @@ def _commit_result(session, attempt, document, payment, kind, result, apply_erro
         document.e_reporting_status = 'SUBMITTED'
         document.processing_state = None
         document.processing_reason = None
-        refs = _provider_refs(document)
+        refs = _provider_refs(document, adapter)
         refs.pop('pending_rejection', None)
         document.provider_refs = refs
         attempt_service.finish_attempt(session, attempt, attempt_service.STATUS_COMPLETED, None)

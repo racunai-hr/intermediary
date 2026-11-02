@@ -1,14 +1,40 @@
 from __future__ import annotations
 
+from datetime import date, datetime, timedelta, timezone
+
 from app.gateway.adapters.super.client import SuperCallResult, SuperHttpClient
 from app.gateway.adapters.super.credentials import CredentialResolver, SuperCredential, default_resolver
-from app.gateway.adapters.super.mapping import ubl_document_type
+from app.gateway.adapters.super.mapping import (
+    MAPPING_VERSION,
+    map_inbound_status,
+    map_outbound_status,
+    ubl_document_type,
+)
 from app.gateway.errors import capability_not_supported, provider_not_configured
 from app.gateway.models import Binding
+from app.gateway.settings import get_gateway_settings
+
+
+def _poll_today() -> date:
+    return datetime.now(timezone.utc).date()
+
+
+def inbound_received_from(checkpoint_start: str | None) -> str:
+    """Earlier of the checkpoint start and a fixed lookback.
+
+    The checkpoint watermark moves to today even when a poll stored nothing.
+    A two-day overlap would then walk past an invoice the previous response missed.
+    """
+    lookback_start = _poll_today() - timedelta(days=get_gateway_settings().super_inbound_lookback_days)
+    if not checkpoint_start:
+        return lookback_start.isoformat()
+    given = date.fromisoformat(checkpoint_start[:10])
+    return min(given, lookback_start).isoformat()
 
 
 class SuperAdapter:
     name = 'super'
+    mapping_version = MAPPING_VERSION
 
     def __init__(self, resolver: CredentialResolver | None = None):
         self.resolver = resolver or default_resolver()
@@ -88,8 +114,14 @@ class SuperAdapter:
             return client.reject_invoice(invoice_guid, reason_type, description)
 
     def list_inbound(self, credential: SuperCredential, **filters) -> list[dict]:
+        # Issue date is ANDed with received date, so an invoice issued before the
+        # window and received inside it would be dropped. UniqueId is a global
+        # counter; UniqueIdFrom = last-50 does not cover the gap between polls.
         with SuperHttpClient(credential) as client:
-            return client.get_invoice_list(**filters)
+            return client.get_invoice_list(
+                received_from=inbound_received_from(filters.get('received_from')),
+                received_to=filters.get('received_to'),
+            )
 
     def get_inbound_ubl(self, credential: SuperCredential, invoice_guid: str) -> str:
         with SuperHttpClient(credential) as client:
@@ -97,7 +129,20 @@ class SuperAdapter:
 
     def list_outbound_statuses(self, credential: SuperCredential, guids: list[str], **filters) -> list[dict]:
         with SuperHttpClient(credential) as client:
-            return client.get_sending_invoice_statuses(guids, **filters)
+            return client.get_sending_invoice_statuses(
+                guids,
+                date_from=filters.get('date_from'),
+                date_to=filters.get('date_to'),
+            )
+
+    def list_item_id(self, item: dict) -> str:
+        return str(item.get('Guid') or item.get('guid') or '')
+
+    def map_inbound_item(self, item: dict):
+        return map_inbound_status(item.get('InvoiceStatus') or item.get('invoiceStatus'))
+
+    def map_outbound_item(self, item: dict):
+        return map_outbound_status(item.get('SendingInvoiceStatus') or item.get('sendingInvoiceStatus'))
 
 
 def require_super_credential(adapter: SuperAdapter, credential_ref: str | None) -> SuperCredential:

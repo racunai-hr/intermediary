@@ -222,9 +222,23 @@ def _serialize_payment(session: Session, payment: Payment, attempt_id: uuid.UUID
 
 
 def list_inbound(session: Session, taxpayer_oib: str, cursor: str | None, limit: int) -> dict:
+    return _list_direction(session, taxpayer_oib, cursor, limit, 'INBOUND')
+
+
+def list_outbound(session: Session, taxpayer_oib: str, cursor: str | None, limit: int) -> dict:
+    return _list_direction(session, taxpayer_oib, cursor, limit, 'OUTBOUND')
+
+
+def _list_direction(
+    session: Session,
+    taxpayer_oib: str,
+    cursor: str | None,
+    limit: int,
+    direction: str,
+) -> dict:
     require_oib(taxpayer_oib)
     limit = min(max(limit, 1), 100)
-    query = session.query(Document).filter_by(taxpayer_oib=taxpayer_oib, direction='INBOUND')
+    query = session.query(Document).filter_by(taxpayer_oib=taxpayer_oib, direction=direction)
     if cursor:
         seq = decode_cursor(cursor, taxpayer_oib)
         query = query.filter(Document.cursor_seq > seq)

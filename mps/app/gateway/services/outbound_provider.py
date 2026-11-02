@@ -5,13 +5,14 @@ from datetime import datetime, timezone
 from sqlalchemy import func, text
 from sqlalchemy.orm import Session
 
-from app.gateway.adapters.super.adapter import SuperAdapter
+from app.gateway.adapters.base import UnimplementedAdapter
+from app.gateway.adapters.registry import get_adapter
 from app.gateway.canonical import require_oib
 from app.gateway.errors import capability_not_supported, invalid_request, provider_not_configured
 from app.gateway.models import OutboundProviderConfig
 from app.gateway.services.bindings import list_bindings
 
-PROVIDERS = {'super'}
+PROVIDERS = {'super', 'pondi'}
 ACTUAL_STATUSES = {'CONFIGURED', 'DISABLED'}
 PUT_STATUSES = {'CONFIGURED', 'DISABLED'}
 
@@ -45,8 +46,16 @@ def outbound_readiness(config: OutboundProviderConfig | None) -> dict:
             'provider_account_resolved': False,
             'ready': False,
         }
+    adapter = get_adapter(config.provider)
+    if isinstance(adapter, UnimplementedAdapter) or not hasattr(adapter, 'resolve'):
+        return {
+            'configured': True,
+            'credential_available': False,
+            'provider_account_resolved': False,
+            'ready': False,
+        }
     try:
-        credential = SuperAdapter().resolve(config.credential_ref)
+        credential = adapter.resolve(config.credential_ref)
     except Exception:
         return {
             'configured': True,
@@ -54,7 +63,7 @@ def outbound_readiness(config: OutboundProviderConfig | None) -> dict:
             'provider_account_resolved': False,
             'ready': False,
         }
-    resolved = bool(credential.company_guid)
+    resolved = bool(getattr(credential, 'account_key', None))
     available = True
     return {
         'configured': True,
@@ -110,7 +119,7 @@ def put_outbound_provider(
     if provider == 'racunai_direct':
         raise capability_not_supported('racunai_direct is disabled for this API version.')
     if provider not in PROVIDERS:
-        raise invalid_request('provider must be super.')
+        raise invalid_request('provider must be super or pondi.')
     credential_ref = payload.get('credential_ref')
     if credential_ref is None and current is not None:
         credential_ref = current.credential_ref
@@ -118,9 +127,10 @@ def put_outbound_provider(
         raise invalid_request('CONFIGURED requires credential_ref.')
     account_key = None
     if status == 'CONFIGURED':
+        adapter = get_adapter(str(provider))
         try:
-            credential = SuperAdapter().resolve(str(credential_ref))
-            account_key = credential.company_guid
+            credential = adapter.resolve(str(credential_ref))
+            account_key = getattr(credential, 'account_key', None)
         except Exception:
             account_key = None
     elif current is not None:

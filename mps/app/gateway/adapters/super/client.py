@@ -4,7 +4,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Callable
 from urllib.parse import parse_qs, urljoin, urlparse
@@ -69,6 +69,13 @@ transport_factory: Callable[[], httpx.BaseTransport | None] | None = None
 def format_payment_amount(amount: str | Decimal) -> str:
     value = amount if isinstance(amount, Decimal) else Decimal(amount)
     return f'{value:.2f}'
+
+
+def inclusive_received_date_to(value: str) -> str:
+    """Super compares ReceivedDateTo as midnight, so a calendar date drops the rest of that day."""
+    if 'T' in value:
+        return value
+    return (date.fromisoformat(value) + timedelta(days=1)).isoformat()
 
 
 def _host(url: str) -> str:
@@ -351,7 +358,7 @@ class SuperHttpClient:
         if received_from:
             data['ReceivedDateFrom'] = received_from
         if received_to:
-            data['ReceivedDateTo'] = received_to
+            data['ReceivedDateTo'] = inclusive_received_date_to(received_to)
         if unique_from is not None:
             data['UniqueIdFrom'] = str(unique_from)
         if unique_to is not None:

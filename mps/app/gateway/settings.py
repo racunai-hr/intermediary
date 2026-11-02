@@ -14,6 +14,7 @@ class GatewaySettings(BaseSettings):
     jwt_algorithm: str = 'HS256'
     # Transitional secret backend. Replace with a real secret store; do not treat env JSON as permanent.
     super_credentials_json: str = '{}'
+    pondi_credentials_json: str = '{}'
     super_lookup_credential_ref: str = ''
     super_connect_timeout: float = 5.0
     super_read_timeout: float = 30.0
@@ -22,6 +23,9 @@ class GatewaySettings(BaseSettings):
     super_token_skew_seconds: int = 60
     super_lease_seconds: int = 60
     super_poll_overlap_days: int = 2
+    # Inbound polls re-list this many days even after the watermark moves to today,
+    # so a document dropped by one response is still visible on the next refresh.
+    super_inbound_lookback_days: int = 45
     super_read_429_max_retries: int = 5
 
     @field_validator('database_url')
