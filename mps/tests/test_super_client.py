@@ -121,6 +121,121 @@ def test_safe_read_429_stops_after_max_retries(monkeypatch):
     assert calls['count'] == 3
 
 
+def test_received_date_to_includes_the_whole_calendar_day():
+    script = SuperScript()
+    script.install()
+    with SuperHttpClient(_credential()) as client:
+        client.get_invoice_list(
+            date_from='2026-10-05',
+            date_to='2026-10-26',
+            received_from='2026-10-05',
+            received_to='2026-10-26',
+        )
+    listed = next(req for req in script.requests if req.url.path.endswith('GetInvoiceList'))
+    payload = form(listed)
+    assert payload['DateFrom'] == '2026-10-05'
+    assert payload['DateTo'] == '2026-10-26'
+    assert payload['ReceivedDateFrom'] == '2026-10-05'
+    assert payload['ReceivedDateTo'] == '2026-10-27'
+
+
+def test_explicit_received_timestamp_is_not_shifted():
+    script = SuperScript()
+    script.install()
+    with SuperHttpClient(_credential()) as client:
+        client.get_invoice_list(received_to='2026-10-26T03:12:18')
+    listed = next(req for req in script.requests if req.url.path.endswith('GetInvoiceList'))
+    assert form(listed)['ReceivedDateTo'] == '2026-10-26T03:12:18'
+
+
+def test_poll_keeps_same_day_receipts_and_a_45_day_lookback(monkeypatch):
+    """A receipt at 03:12 on the window's end date stays included.
+
+    An invoice issued 30 Sep and received 7 Oct is not cut by issue date or UniqueId.
+    After the watermark is today, the next poll still starts 45 days back, not 2.
+    """
+    from datetime import date, timedelta
+
+    from app.gateway.adapters.super.adapter import SuperAdapter
+
+    today = date(2026, 10, 26)
+    monkeypatch.setattr('app.gateway.adapters.super.adapter._poll_today', lambda: today)
+    script = SuperScript()
+    script.install()
+    adapter = SuperAdapter()
+    adapter.list_inbound(
+        adapter.resolve(CRED_REF),
+        date_from='2026-10-24',
+        date_to='2026-10-26',
+        received_from='2026-10-24',
+        received_to='2026-10-26',
+        unique_from=689013,
+    )
+    listed = next(req for req in script.requests if req.url.path.endswith('GetInvoiceList'))
+    payload = form(listed)
+    assert 'DateFrom' not in payload
+    assert 'DateTo' not in payload
+    assert 'UniqueIdFrom' not in payload
+    assert 'UniqueIdTo' not in payload
+    assert payload['ReceivedDateFrom'] == (today - timedelta(days=45)).isoformat()
+    assert payload['ReceivedDateTo'] == '2026-10-27'
+
+
+def test_poll_keeps_a_checkpoint_start_older_than_the_lookback(monkeypatch):
+    from datetime import date, timedelta
+
+    from app.gateway.adapters.super.adapter import SuperAdapter
+
+    today = date(2026, 10, 26)
+    monkeypatch.setattr('app.gateway.adapters.super.adapter._poll_today', lambda: today)
+    wide = (today - timedelta(days=400)).isoformat()
+    script = SuperScript()
+    script.install()
+    adapter = SuperAdapter()
+    adapter.list_inbound(
+        adapter.resolve(CRED_REF),
+        received_from=wide,
+        received_to='2026-10-26',
+        unique_from=1,
+    )
+    listed = next(req for req in script.requests if req.url.path.endswith('GetInvoiceList'))
+    payload = form(listed)
+    assert payload['ReceivedDateFrom'] == wide
+    assert 'UniqueIdFrom' not in payload
+
+
+def test_known_inbound_guid_skips_ubl_download():
+    from app.gateway.services.inbound_pull import fetch_inbound_batch
+
+    downloaded: list[str] = []
+
+    class Listing:
+        def list_inbound(self, credential, **filters):
+            return [
+                {'Guid': 'known-guid', 'UniqueId': 1, 'InvoiceStatus': 10},
+                {'Guid': 'new-guid', 'UniqueId': 2, 'InvoiceStatus': 10},
+                {'UniqueId': 3, 'InvoiceStatus': 10},
+            ]
+
+        def list_item_id(self, item):
+            return str(item.get('Guid') or '')
+
+        def get_inbound_ubl(self, credential, guid):
+            downloaded.append(guid)
+            return '<Invoice/>'
+
+    batch = fetch_inbound_batch(
+        Listing(),
+        object(),
+        {},
+        known_guids={'known-guid'},
+    )
+    assert downloaded == ['new-guid']
+    assert batch[0][1] is None
+    assert batch[1] == ({'Guid': 'new-guid', 'UniqueId': 2, 'InvoiceStatus': 10}, '<Invoice/>')
+    assert batch[2][1] is None
+
+
 def test_http_base_url_is_rejected(monkeypatch):
     import json
 

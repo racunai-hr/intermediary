@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import date, datetime, timedelta, timezone
+
 from app.gateway.adapters.super.client import SuperCallResult, SuperHttpClient
 from app.gateway.adapters.super.credentials import CredentialResolver, SuperCredential, default_resolver
 from app.gateway.adapters.super.mapping import (
@@ -10,6 +12,24 @@ from app.gateway.adapters.super.mapping import (
 )
 from app.gateway.errors import capability_not_supported, provider_not_configured
 from app.gateway.models import Binding
+from app.gateway.settings import get_gateway_settings
+
+
+def _poll_today() -> date:
+    return datetime.now(timezone.utc).date()
+
+
+def inbound_received_from(checkpoint_start: str | None) -> str:
+    """Earlier of the checkpoint start and a fixed lookback.
+
+    The checkpoint watermark moves to today even when a poll stored nothing.
+    A two-day overlap would then walk past an invoice the previous response missed.
+    """
+    lookback_start = _poll_today() - timedelta(days=get_gateway_settings().super_inbound_lookback_days)
+    if not checkpoint_start:
+        return lookback_start.isoformat()
+    given = date.fromisoformat(checkpoint_start[:10])
+    return min(given, lookback_start).isoformat()
 
 
 class SuperAdapter:
@@ -94,8 +114,14 @@ class SuperAdapter:
             return client.reject_invoice(invoice_guid, reason_type, description)
 
     def list_inbound(self, credential: SuperCredential, **filters) -> list[dict]:
+        # Issue date is ANDed with received date, so an invoice issued before the
+        # window and received inside it would be dropped. UniqueId is a global
+        # counter; UniqueIdFrom = last-50 does not cover the gap between polls.
         with SuperHttpClient(credential) as client:
-            return client.get_invoice_list(**filters)
+            return client.get_invoice_list(
+                received_from=inbound_received_from(filters.get('received_from')),
+                received_to=filters.get('received_to'),
+            )
 
     def get_inbound_ubl(self, credential: SuperCredential, invoice_guid: str) -> str:
         with SuperHttpClient(credential) as client:

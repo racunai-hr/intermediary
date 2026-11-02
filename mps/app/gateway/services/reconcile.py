@@ -19,6 +19,7 @@ from app.gateway.services.inbound_pull import (
     checkpoint_filters,
     fetch_inbound_batch,
     fetch_outbound_batch,
+    known_inbound_guids,
     persist_historical_outbound_batch,
     persist_inbound_batch,
 )
@@ -95,6 +96,7 @@ def run_reconciliation(session_factory, reconciliation_id) -> None:
         inbound_credential = None
         inbound_filters = None
         inbound_setup_error = None
+        known_inbound: set[str] = set()
         outbound_config = get_actual(session, job.taxpayer_oib)
         outbound_adapter = None
         outbound_credential = None
@@ -110,12 +112,19 @@ def run_reconciliation(session_factory, reconciliation_id) -> None:
                 return
             try:
                 inbound_credential = inbound_adapter.resolve(binding.credential_ref)
+                account_key = _account_key(inbound_credential)
                 _, inbound_filters = checkpoint_filters(
                     session,
                     job.taxpayer_oib,
-                    _account_key(inbound_credential),
+                    account_key,
                     'inbound_list',
                     inbound_adapter.name,
+                )
+                known_inbound = known_inbound_guids(
+                    session,
+                    taxpayer_oib=job.taxpayer_oib,
+                    provider=inbound_adapter.name,
+                    account_key=account_key,
                 )
             except GatewayError as exc:
                 job.status = 'FAILED'
@@ -177,7 +186,12 @@ def run_reconciliation(session_factory, reconciliation_id) -> None:
     try:
         if inbound_credential is not None and inbound_filters is not None and inbound_adapter is not None:
             try:
-                batch = fetch_inbound_batch(inbound_adapter, inbound_credential, inbound_filters)
+                batch = fetch_inbound_batch(
+                    inbound_adapter,
+                    inbound_credential,
+                    inbound_filters,
+                    known_guids=known_inbound,
+                )
             except (GatewayError, SuperHttpError, PondiHttpError) as exc:
                 inbound_error = _provider_error(exc)
         if historical_outbound and outbound_credential is not None and outbound_filters is not None:

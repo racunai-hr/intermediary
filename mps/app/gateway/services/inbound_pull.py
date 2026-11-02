@@ -75,15 +75,46 @@ def checkpoint_filters(
     }
 
 
-def fetch_inbound_batch(adapter, credential, filters: dict) -> list[tuple[dict, str | None]]:
+def known_inbound_guids(
+    session: Session,
+    *,
+    taxpayer_oib: str,
+    provider: str,
+    account_key: str,
+) -> set[str]:
+    rows = (
+        session.query(Document.provider_invoice_guid)
+        .filter_by(
+            taxpayer_oib=taxpayer_oib,
+            direction='INBOUND',
+            bound_provider=provider,
+            provider_account_key=account_key,
+        )
+        .filter(Document.provider_invoice_guid.isnot(None))
+        .all()
+    )
+    return {row[0] for row in rows if row[0]}
+
+
+def fetch_inbound_batch(
+    adapter,
+    credential,
+    filters: dict,
+    *,
+    known_guids: set[str] | None = None,
+) -> list[tuple[dict, str | None]]:
     fetcher = getattr(adapter, 'fetch_inbound_with_ubl', None)
     if callable(fetcher):
         return fetcher(credential, **filters)
+    known = known_guids or set()
     invoices = adapter.list_inbound(credential, **filters)
     batch: list[tuple[dict, str | None]] = []
     for item in invoices:
         guid = adapter.list_item_id(item)
         if not guid:
+            batch.append((item, None))
+            continue
+        if guid in known:
             batch.append((item, None))
             continue
         try:
@@ -127,7 +158,7 @@ def persist_inbound_batch(
     mapping_version = getattr(adapter, 'mapping_version', '')
     for item, ubl in batch:
         guid = adapter.list_item_id(item)
-        if not guid or ubl is None:
+        if not guid:
             errors += 1
             continue
         existing = (
@@ -147,6 +178,9 @@ def persist_inbound_batch(
             unique = _item_unique(item)
             if unique is not None:
                 max_unique = max(unique, max_unique or 0)
+            continue
+        if ubl is None:
+            errors += 1
             continue
         mapped = adapter.map_inbound_item(item)
         document = Document(
